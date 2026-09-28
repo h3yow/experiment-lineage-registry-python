@@ -13,6 +13,9 @@ ELR_CAPACITY_MAX_BYTES         Live artifact storage hard cap    1000000000
 ELR_CAPACITY_POLICY            reject|evict-oldest|delay         reject
 ELR_GC_ON_OVERFLOW             Try GC to free space first        true
 ELR_CAPACITY_WAIT_TIMEOUT_SEC  Max wait when policy=delay        5.0
+ELR_DERIVATION_PAGE_LIMIT      Default descendant page size      100
+ELR_DERIVATION_MAX_LIMIT       Max descendant page size          1000
+ELR_DERIVATION_SCAN_CAP        Hard cap on descendant traversal  100000
 ELR_LOG_LEVEL                  logging level                     INFO
 ============================== ================================= ===============
 
@@ -44,6 +47,9 @@ class Settings:
     capacity_policy: str
     gc_on_overflow: bool
     capacity_wait_timeout_seconds: float
+    derivation_page_limit: int
+    derivation_max_limit: int
+    derivation_scan_cap: int
     log_level: str
 
 
@@ -131,6 +137,37 @@ def load_settings() -> Settings:
         default=5.0,
     )
 
+    derivation_page = _parse_int(
+        "ELR_DERIVATION_PAGE_LIMIT",
+        _env("ELR_DERIVATION_PAGE_LIMIT"),
+        default=100,
+        minimum=1,
+    )
+    derivation_max = _parse_int(
+        "ELR_DERIVATION_MAX_LIMIT",
+        _env("ELR_DERIVATION_MAX_LIMIT"),
+        default=1000,
+        minimum=1,
+    )
+    derivation_scan_cap = _parse_int(
+        "ELR_DERIVATION_SCAN_CAP",
+        _env("ELR_DERIVATION_SCAN_CAP"),
+        default=100_000,
+        minimum=1,
+    )
+    if derivation_page > derivation_max:
+        raise ConfigError(
+            "ELR_DERIVATION_PAGE_LIMIT must be <= ELR_DERIVATION_MAX_LIMIT, got "
+            f"{derivation_page} > {derivation_max}",
+            code="invalid_config",
+        )
+    if derivation_max > derivation_scan_cap:
+        raise ConfigError(
+            "ELR_DERIVATION_MAX_LIMIT must be <= ELR_DERIVATION_SCAN_CAP, got "
+            f"{derivation_max} > {derivation_scan_cap}",
+            code="invalid_config",
+        )
+
     log_level = (
         _env("ELR_LOG_LEVEL") or "INFO"
     ).upper()
@@ -149,5 +186,8 @@ def load_settings() -> Settings:
         capacity_policy=policy_raw,
         gc_on_overflow=gc_on_overflow,
         capacity_wait_timeout_seconds=wait_timeout,
+        derivation_page_limit=derivation_page,
+        derivation_max_limit=derivation_max,
+        derivation_scan_cap=derivation_scan_cap,
         log_level=log_level,
     )

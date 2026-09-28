@@ -101,3 +101,17 @@ class ReproductionAttempt:
     reproducible: bool
     divergence_json: str
     attempted_at: str
+
+
+@dataclass
+class RunDerivation:
+    id: int
+    source_run_id: str
+    derived_run_id: str
+    idempotency_key: str | None
+    # Canonical digest of the replacement set; (source, digest) is unique so
+    # identical re-derivations always land on the same derived run.
+    replacement_digest: str
+    replacements_json: str
+    changes_json: str
+    created_at: str

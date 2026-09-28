@@ -8,7 +8,9 @@ written before the metadata commit.
 
 from __future__ import annotations
 
+import base64
 import json
+import sqlite3
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -16,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import Settings
+from . import derivation as deriv
 from .errors import (
     CapacityDelayedError,
     CapacityRejectedError,
@@ -48,13 +51,19 @@ from .models import (
     TERMINAL_STATES,
     Run,
     RunArtifact,
+    RunDerivation,
 )
 from .schemas import (
     ArtifactRegister,
     ArtifactView,
+    DerivationRequest,
+    DerivationView,
+    DescendantItem,
+    DescendantPage,
     ExperimentCreate,
     ExperimentView,
     GCResult,
+    InputChange,
     LineageCreate,
     LineageView,
     MetricComparisonRequest,
@@ -82,6 +91,10 @@ def _new_id(prefix: str) -> str:
 
 def _loads(raw: str) -> Any:
     return json.loads(raw) if raw else {}
+
+
+def _is_replaced(artifact_id: str, replacements: dict[str, str]) -> bool:
+    return artifact_id in replacements
 
 
 class RegistryService:
@@ -364,6 +377,388 @@ class RegistryService:
                 extra={"kv": {"run_id": run_id, "from": current, "to": target, "reason": "accepted"}},
             )
             return self._run_view(run)
+
+    # ======================================================================
+    # Derivations: branch a new run from a terminal source run
+    # ======================================================================
+    DERIVATION_RELATION = "derived_from"
+
+    def derive_run(
+        self, source_run_id: str, req: DerivationRequest
+    ) -> tuple[DerivationView, bool]:
+        with self._lock:
+            source = self._require_run(source_run_id)
+            if source.state not in TERMINAL_STATES:
+                log.info(
+                    "derivation_denied",
+                    extra={"kv": {"source_run_id": source.id, "state": source.state,
+                                  "reason": "source_not_terminal"}},
+                )
+                raise ConflictError(
+                    f"source run {source.id!r} is in state {source.state!r}; only "
+                    f"terminal runs {sorted(TERMINAL_STATES)} can be derived from",
+                    code="source_not_terminal",
+                )
+
+            replacements = dict(req.artifact_replacements)
+            remove = set(req.remove_artifacts)
+
+            # --- structural validation of the requested replacement set ----
+            source_refs = [
+                ref.artifact_id
+                for ref in self.storage.artifacts_of_run(source.id)
+                if ref.role == "input"
+            ]
+            source_ids = sorted(set(source_refs))
+            self._validate_replacement_shape(source, source_ids, replacements, remove)
+
+            # Every replacement target must exist and be live *before* anything
+            # is written; missing/GCollected items name the exact artifact.
+            target_ids = sorted(set(replacements.values()))
+            self._resolve_artifact_shas(target_ids)
+            # The inherited inputs must still be live too (a source run keeps
+            # its refs, so this is a defensive re-check against torn state).
+            self._resolve_artifact_shas(source_ids)
+
+            # --- compute the effective inputs of the derived run -----------
+            kept = [a for a in source_ids
+                    if a not in remove and not _is_replaced(a, replacements)]
+            target_set = set(target_ids)
+            collisions = sorted(set(kept) & target_set)
+            if collisions:
+                # A replacement target collides with another inherited input.
+                raise ConflictError(
+                    f"replacement target already present among inherited "
+                    f"dependencies: {collisions}",
+                    code="duplicate_artifact_dependency",
+                )
+            derived_ids = sorted(set(kept) | target_set)
+
+            source_env = _loads(source.env_json)
+            source_config = _loads(source.config_json)
+            derived_env = deriv.deep_merge(source_env, req.env)
+            derived_config = deriv.deep_merge(source_config, req.config)
+
+            env_changes = deriv.diff_section("env", source_env, derived_env)
+            config_changes = deriv.diff_section("config", source_config, derived_config)
+            artifact_changes = deriv.diff_artifacts(
+                source_ids, derived_ids, replacements, remove
+            )
+            changes = env_changes + config_changes + artifact_changes
+
+            digest = deriv.replacement_digest(
+                replacements, req.remove_artifacts, req.env, req.config
+            )
+
+            # --- idempotency / content-based dedupe ------------------------
+            existing = self.storage.get_derivation_by_replacement(source.id, digest)
+            if existing is not None:
+                if (
+                    req.idempotency_key is not None
+                    and existing.idempotency_key is not None
+                    and existing.idempotency_key != req.idempotency_key
+                ):
+                    self._derivation_key_conflict(existing, req)
+                log.info(
+                    "derivation_idempotent_replay",
+                    extra={"kv": {"source_run_id": source.id,
+                                  "derived_run_id": existing.derived_run_id,
+                                  "basis": "source+replacement_digest"}},
+                )
+                return self._derivation_view(existing, created=False), False
+
+            if req.idempotency_key is not None:
+                by_key = self.storage.get_derivation_by_idempotency(
+                    source.id, req.idempotency_key
+                )
+                if by_key is not None and by_key.replacement_digest != digest:
+                    self._derivation_key_conflict(by_key, req)
+
+            # --- create the derived run, record and lineage edge atomically
+            derived_shas = [
+                self.storage.get_artifact(aid).sha256 for aid in derived_ids
+            ]
+            fingerprint = fingerprint_run_inputs(
+                derived_env, derived_config, derived_shas
+            )
+            now = _utcnow()
+            derived_run = Run(
+                id=_new_id("run"),
+                experiment_id=source.experiment_id,
+                idempotency_key=None,  # derivation keys live in run_derivations
+                state="created",
+                created_at=now,
+                updated_at=now,
+                env_json=canonicalize(derived_env).decode("utf-8"),
+                config_json=canonicalize(derived_config).decode("utf-8"),
+                fingerprint=fingerprint,
+                metadata_json=source.metadata_json,
+            )
+            record = RunDerivation(
+                id=0,
+                source_run_id=source.id,
+                derived_run_id=derived_run.id,
+                idempotency_key=req.idempotency_key,
+                replacement_digest=digest,
+                replacements_json=canonicalize(
+                    {
+                        "artifact_replacements": replacements,
+                        "remove_artifacts": sorted(remove),
+                        "env": req.env,
+                        "config": req.config,
+                    }
+                ).decode("utf-8"),
+                changes_json=canonicalize(changes).decode("utf-8"),
+                created_at=now,
+            )
+            edge = LineageEdge(
+                id=0,
+                upstream_run_id=source.id,
+                downstream_run_id=derived_run.id,
+                relation=self.DERIVATION_RELATION,
+                registered_at=now,
+            )
+            try:
+                with self.storage.begin():
+                    self.storage.create_run(derived_run)
+                    for artifact_id in derived_ids:
+                        self.storage.add_run_artifact(
+                            RunArtifact(
+                                run_id=derived_run.id,
+                                artifact_id=artifact_id,
+                                role="input",
+                                registered_at=now,
+                            )
+                        )
+                    record = self.storage.add_run_derivation(record)
+                    if not self.storage.lineage_edge_exists(
+                        edge.upstream_run_id, edge.downstream_run_id, edge.relation
+                    ):
+                        self.storage.add_lineage_edge(edge)
+            except sqlite3.IntegrityError:
+                # Cross-process race (multiple workers): another writer
+                # already committed this (source, replacement_digest). The
+                # transaction is rolled back; converge on the existing run.
+                winner = self.storage.get_derivation_by_replacement(source.id, digest)
+                if winner is not None:
+                    log.info(
+                        "derivation_idempotent_replay",
+                        extra={"kv": {"source_run_id": source.id,
+                                      "derived_run_id": winner.derived_run_id,
+                                      "basis": "unique_constraint_recovery"}},
+                    )
+                    return self._derivation_view(winner, created=False), False
+                raise
+            log.info(
+                "run_derived",
+                extra={
+                    "kv": {
+                        "source_run_id": source.id,
+                        "derived_run_id": derived_run.id,
+                        "basis": "source+replacement_digest",
+                        "replacement_digest": digest[:12],
+                        "changes": len(changes),
+                        "fingerprint": fingerprint[:12],
+                    }
+                },
+            )
+            return self._derivation_view(record, created=True), True
+
+    def _validate_replacement_shape(
+        self,
+        source: Run,
+        source_ids: list[str],
+        replacements: dict[str, str],
+        remove: set[str],
+    ) -> None:
+        if not isinstance(replacements, dict):  # pragma: no cover - pydantic types
+            raise ConflictError("artifact_replacements must be an object",
+                                code="invalid_replacement")
+        source_set = set(source_ids)
+        unknown = sorted(set(replacements) - source_set)
+        if unknown:
+            raise DanglingReferenceError(
+                f"replacement source artifact(s) {unknown} are not input "
+                f"dependencies of source run {source.id!r}; only existing inputs "
+                f"can be replaced",
+                code="replacement_source_not_found",
+            )
+        unknown_remove = sorted(remove - source_set)
+        if unknown_remove:
+            raise DanglingReferenceError(
+                f"cannot remove artifact(s) {unknown_remove}: not input "
+                f"dependencies of source run {source.id!r}",
+                code="replacement_source_not_found",
+            )
+        overlap = sorted(set(replacements) & remove)
+        if overlap:
+            raise ConflictError(
+                f"artifact(s) {overlap} are both replaced and removed; pick one",
+                code="invalid_replacement",
+            )
+        self_map = sorted(k for k, v in replacements.items() if k == v)
+        if self_map:
+            raise ConflictError(
+                f"artifact(s) {self_map} replaced with themselves",
+                code="invalid_replacement",
+            )
+
+    def _derivation_key_conflict(self, existing: RunDerivation, req: DerivationRequest) -> None:
+        log.info(
+            "derivation_idempotency_conflict",
+            extra={"kv": {"source_run_id": existing.source_run_id,
+                          "derived_run_id": existing.derived_run_id,
+                          "basis": "idempotency_key"}},
+        )
+        raise IdempotencyConflictError(
+            f"derivation idempotency key {req.idempotency_key!r} already used for "
+            f"source run {existing.source_run_id!r} by derived run "
+            f"{existing.derived_run_id!r} with a different replacement set",
+            code="derivation_idempotency_mismatch",
+        )
+
+    @staticmethod
+    def _derivation_view(record: RunDerivation, *, created: bool) -> DerivationView:
+        return DerivationView(
+            id=record.id,
+            source_run_id=record.source_run_id,
+            derived_run_id=record.derived_run_id,
+            idempotency_key=record.idempotency_key,
+            replacement_digest=record.replacement_digest,
+            replacements=_loads(record.replacements_json),
+            changes=[InputChange(**item) for item in _loads(record.changes_json)],
+            created=created,
+            created_at=record.created_at,
+        )
+
+    def get_derivation(self, run_id: str) -> DerivationView:
+        """Return the derivation record that produced *run_id*, if any."""
+        with self._lock:
+            self._require_run(run_id)
+            record = self.storage.get_derivation_of_run(run_id)
+            if record is None:
+                raise NotFoundError(
+                    f"run {run_id!r} was not created by derivation",
+                    code="derivation_not_found",
+                )
+            return self._derivation_view(record, created=False)
+
+    def list_descendants(
+        self,
+        root_run_id: str,
+        *,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> DescendantPage:
+        """Breadth-first page over every run transitively derived from root.
+
+        Ordering is deterministic: breadth-first, ties broken by derivation
+        registration order. The result is always honestly annotated:
+        ``truncated`` is set with a concrete reason whenever the hard scan cap
+        was reached or more rows remain.
+        """
+        with self._lock:
+            self._require_run(root_run_id)
+            page_limit = self.settings.derivation_page_limit if limit is None else limit
+            if not isinstance(page_limit, int) or isinstance(page_limit, bool):
+                raise ConflictError("limit must be an integer", code="invalid_limit")
+            if page_limit < 1:
+                raise ConflictError("limit must be >= 1", code="invalid_limit")
+            if page_limit > self.settings.derivation_max_limit:
+                raise ConflictError(
+                    f"limit {page_limit} exceeds maximum "
+                    f"{self.settings.derivation_max_limit}",
+                    code="limit_exceeded",
+                )
+
+            offset = self._decode_cursor(cursor)
+            scan_cap = self.settings.derivation_scan_cap
+
+            # BFS; visited guards against any diamond in the derivation graph.
+            visited: set[str] = {root_run_id}
+            queue: list[tuple[str, int]] = [(root_run_id, 0)]
+            ordered: list[DescendantItem] = []
+            cap_hit = False
+            scanned = 0
+            while queue:
+                parent, depth = queue.pop(0)
+                for record in self.storage.direct_children(parent):
+                    scanned += 1
+                    if scanned > scan_cap:
+                        cap_hit = True
+                        break
+                    child = record.derived_run_id
+                    if child in visited:
+                        continue
+                    visited.add(child)
+                    ordered.append(
+                        DescendantItem(
+                            run_id=child,
+                            source_run_id=record.source_run_id,
+                            depth=depth + 1,
+                            derivation_id=record.id,
+                            created_at=record.created_at,
+                        )
+                    )
+                    queue.append((child, depth + 1))
+                if cap_hit:
+                    break
+
+            total_scanned = len(ordered)
+            page = ordered[offset : offset + page_limit]
+            more_after_page = offset + len(page) < total_scanned
+            truncated = cap_hit or more_after_page
+            reason = None
+            next_offset: int | None = None
+            next_cursor: str | None = None
+            if cap_hit:
+                reason = "scan_cap"
+            elif more_after_page:
+                reason = "page_limit"
+            if more_after_page:
+                next_offset = offset + len(page)
+                next_cursor = self._encode_cursor(next_offset)
+
+            result = DescendantPage(
+                root_run_id=root_run_id,
+                items=page,
+                limit=page_limit,
+                offset=offset,
+                returned=len(page),
+                truncated=truncated,
+                truncation_reason=reason,
+                next_offset=next_offset,
+                next_cursor=next_cursor,
+            )
+            log.info(
+                "descendants_listed",
+                extra={"kv": {"root_run_id": root_run_id, "returned": len(page),
+                              "offset": offset, "truncated": str(truncated),
+                              "basis": reason or "complete"}},
+            )
+            return result
+
+    @staticmethod
+    def _encode_cursor(offset: int) -> str:
+        raw = json.dumps({"offset": int(offset)}, separators=(",", ":")).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    @staticmethod
+    def _decode_cursor(cursor: str | None) -> int:
+        if cursor is None:
+            return 0
+        try:
+            padded = cursor + "=" * (-len(cursor) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
+            offset = int(payload["offset"])
+        except (ValueError, json.JSONDecodeError, UnicodeError) as exc:
+            raise ConflictError(
+                f"invalid pagination cursor {cursor!r}", code="invalid_cursor"
+            ) from exc
+        if offset < 0:
+            raise ConflictError("invalid pagination cursor: negative offset",
+                                code="invalid_cursor")
+        return offset
 
     # ======================================================================
     # Artifacts: content-addressed registration, versions, capacity
@@ -1020,6 +1415,7 @@ class RegistryService:
 
     def _run_view(self, run: Run) -> RunView:
         refs = self.storage.artifacts_of_run(run.id)
+        derivation = self.storage.get_derivation_of_run(run.id)
         return RunView(
             id=run.id,
             experiment_id=run.experiment_id,
@@ -1033,4 +1429,5 @@ class RegistryService:
             artifacts=sorted({ref.artifact_id for ref in refs}),
             metadata=_loads(run.metadata_json),
             terminal=run.state in TERMINAL_STATES,
+            derived_from=derivation.source_run_id if derivation else None,
         )

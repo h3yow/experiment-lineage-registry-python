@@ -10,7 +10,7 @@
 uv sync
 uv run uvicorn main:app --reload          # 与原始骨架相同的启动方式
 # 或
-uv run pytest                              # 运行全部测试（82 个用例）
+uv run pytest                              # 运行全部测试（132 个用例）
 ```
 
 服务默认把数据写入 `.elreg-data/`（`registry.db` + `artifacts/`）。
@@ -28,9 +28,13 @@ uv run pytest                              # 运行全部测试（82 个用例�
 | `ELR_CAPACITY_POLICY` | 超限策略：`reject` / `evict-oldest` / `delay` | `reject` |
 | `ELR_GC_ON_OVERFLOW` | 登记新制品前先尝试回收 | `true` |
 | `ELR_CAPACITY_WAIT_TIMEOUT_SEC` | `delay` 策略最长等待秒数 | `5.0` |
+| `ELR_DERIVATION_PAGE_LIMIT` | 派生后代查询默认分页大小 | `100` |
+| `ELR_DERIVATION_MAX_LIMIT` | 单次后代查询允许的最大 `limit` | `1000` |
+| `ELR_DERIVATION_SCAN_CAP` | 后代遍历的硬上限（边数） | `100000` |
 | `ELR_LOG_LEVEL` | 日志级别 | `INFO` |
 
-不支持的取值（未知策略、负数容量、非法布尔值、非法日志级别等）在
+不支持的取值（未知策略、负数容量、非法布尔值、非法日志级别，以及
+`PAGE_LIMIT > MAX_LIMIT`、`MAX_LIMIT > SCAN_CAP` 等）在
 **进程启动加载配置时立即失败**（`ConfigError code=invalid_config`），
 不会拖到首次使用才暴露。
 
@@ -68,6 +72,93 @@ created ──► queued ──► running ──► succeeded  (终态)
   **不会产生第二个运行，也不会静默覆盖**。
 * 幂等键按实验隔离；不同实验可复用同一键。
 * 比较口径与指纹一致：键顺序、JSON 空白、易失时间字段不影响判定。
+
+## 派生（Derivation）：以终态运行为起点迭代
+
+派生让一次**已经进入终态**（`succeeded / failed / canceled`）的运行成为新
+运行的起点：显式声明要换掉的输入，其余全部沿用来源运行。来源运行**只读、
+永不被派生改动**，新运行从 `created` 开始走自己的状态机。
+
+`POST /runs/{source_run_id}/derivations`：
+
+```json
+{
+  "artifact_replacements": {"a@v1": "a@v2"},
+  "remove_artifacts": ["b@v1"],
+  "env": {"cuda": "12.4"},
+  "config": {"lr": 0.2, "model": {"hidden": 512}},
+  "idempotency_key": "iter-7"
+}
+```
+
+* `artifact_replacements`：**键必须是来源运行已有的 input 制品**，值是替换
+  目标；键不在来源依赖里 → `409 replacement_source_not_found`。
+* `remove_artifacts`：从继承集合中移除的已有 input；同一项既替换又移除 →
+  `400 invalid_replacement`。
+* `env` / `config`：在来源值上做**深度合并（deep-merge）**，未提到的路径
+  原样继承；不是整体覆盖。
+* 不支持对非终态运行派生 → `409 source_not_terminal`。
+
+### 派生身份与幂等
+
+* 服务端对“来源运行 + 规范化后的替换集合”计算 `replacement_digest`，
+  `(source_run_id, replacement_digest)` 唯一：**同一来源 + 同一套替换内容
+  重复提交，永远落到同一个派生运行**（首次 `201 created=true`，重放
+  `200 created=false`），即使不带 `idempotency_key` 也一样。
+* 带了 `idempotency_key` 时：键相同但替换内容对不上 →
+  `409 derivation_idempotency_mismatch`，**绝不悄悄产生第二个运行**。
+* 幂等作用域是“来源运行”：不同来源可复用同一键。
+* 每个派生都持久化一条 `run_derivations` 记录（来源、派生运行、替换摘要、
+  逐项变更、时间），任何派生都能反查“从哪来、换了什么”：
+  `GET /runs/{derived_run_id}/derivation`。普通运行查派生记录 →
+  `404 derivation_not_found`。`GET /runs/{id}` 的 `derived_from` 字段给出
+  直接来源（非派生运行为 `null`）。
+
+### 替换、指纹与逐项变更
+
+* 派生运行的指纹按**替换后的实际输入**重新计算，规则与提交时完全一致：
+  JSON 键顺序/无害空白、易失时间字段、制品依赖的书写顺序与重复都不造成
+  指纹漂移；制品贡献的仍是**内容 sha256**。
+* 响应 `changes` 对每一处真实差异逐项标注，不给笼统“不一致”：
+
+  | category | op | key 含义 |
+  | --- | --- | --- |
+  | `env` / `config` | `added` / `removed` / `replaced` | 点分叶子路径 |
+  | `artifact` | `replaced` | 被替换掉的来源制品 id（值给出新 id） |
+  | `artifact` | `removed` | 被移除的来源制品 id |
+  | `artifact` | `added` | 不在替换映射里、真正新增的制品 id |
+
+  每项带 `source_value` / `derived_value` 双方取值。
+
+### 父子谱系查询
+
+* 每次派生都会登记一条 `relation=derived_from` 的血缘边
+  （source=upstream → derived=downstream），因此既可以用既有的
+  `GET /runs/{id}/lineage/upstream|downstream` 看直接父子，也可以用专用
+  接口遍历整棵派生树。
+* `GET /runs/{id}/descendants?limit=&cursor=`：按 **BFS** 遍历所有传递后代
+  （菱形谱系会去重），每项含 `run_id / source_run_id / depth /
+  derivation_id / created_at`。
+* **容量与分页是显式的、会如实标注**：
+  * `limit` 默认 `ELR_DERIVATION_PAGE_LIMIT`，必须 ≥1 且 ≤
+    `ELR_DERIVATION_MAX_LIMIT`，否则 `400 invalid_limit / limit_exceeded`；
+  * 遍历边数有硬上限 `ELR_DERIVATION_SCAN_CAP`；
+  * 还有下一页时返回 `truncated=true, truncation_reason=page_limit` 与
+    `next_cursor / next_offset`；撞上硬上限时
+    `truncation_reason=scan_cap`。**绝不把截断结果当完整结果返回**；
+  * `cursor` 不透明，非法游标 → `400 invalid_cursor`。
+
+### 并发、回收与边界
+
+* 所有派生与制品登记/回收共用同一把服务锁并在单事务内落库
+  （新运行 + 制品引用 + 派生记录 + 血缘边原子提交），因此：
+  * 同一来源被并发派生、且替换集合相同 → **只产生一个运行**；
+  * 派生**不会引用不存在或已被/正被回收的制品**：替换目标在写入前统一校验，
+    不存在 → `404 artifact_not_found`，已回收 → `409 artifact_deleted`，
+    消息点名具体是哪一项；失败时事务回滚，**不留下半个派生运行**，也不会
+    悄悄换另一个制品顶替。
+* 派生新运行不登记新制品内容，因此不受容量策略限制；容量策略仍只作用于
+  制品上传。
 
 ## 制品：内容寻址、版本化与回收
 
@@ -139,6 +230,18 @@ created ──► queued ──► running ──► succeeded  (终态)
 * 每次校验都作为 `reproduction_attempts` 记录持久化（含是否可复现），
   历史可查。
 
+## 兼容性范围
+
+派生能力是**纯增量**，不改变任何既有行为：
+
+* 启动方式（`uvicorn main:app`）、配置读取方式（环境变量 + 启动期 fail-fast）
+  不变；根路由 `GET /`、`/health` 与所有既有路径、请求/响应字段保持兼容。
+* `RunView` 仅**新增**一个可空字段 `derived_from`，旧调用方无需改动。
+* 新增的三个环境变量都有确定默认值；非法取值在启动期直接报错
+  （见“配置”一节）。
+* 派生血缘使用新 relation 值 `derived_from`，不与用户自定义 relation 冲突；
+  既有 `/lineage` 与上下游查询语义不变。
+
 ## 指标与参数
 
 * `POST /runs/{id}/metrics {"name","value","step?"}`：
@@ -175,6 +278,9 @@ POST   /experiments        GET /experiments   GET /experiments/{id}
 POST   /runs              GET /runs[?experiment_id=]   GET /runs/{id}
 POST   /runs/{id}/transitions             状态流转
 POST   /runs/{id}/artifacts               挂载制品引用
+POST   /runs/{id}/derivations             从终态运行派生新运行
+GET    /runs/{id}/derivation              反查某运行的派生来源与替换明细
+GET    /runs/{id}/descendants[?limit=&cursor=]   分页遍历传递后代
 POST   /artifacts (raw bytes, ?id=&filename=&media_type=)
 GET    /artifacts        GET /artifacts/{id}   GET /artifacts/{id}/content
 POST   /lineage
@@ -196,7 +302,8 @@ GET    /integrity                          悬空引用巡检
 
 ```bash
 uv run pytest                      # 全量（含并发、竞态、成环、重跑校验）
-uv run pytest -k concurrency       # 仅并发竞态
+uv run pytest -k concurrency       # 仅并发竞态（含并发派生 / 派生撞回收）
+uv run pytest -k derivation        # 派生、幂等、逐项变更、后代分页
 uv run pytest -k "illegal or cycle or mismatch"
 ```
 
@@ -209,6 +316,9 @@ event=run_transition run_id=run_... from=created to=queued reason=accepted
 event=run_transition_denied run_id=run_... from=queued to=queued reason=already_in_state
 event=lineage_cycle_rejected upstream=run_a downstream=run_b relation=depends_on
 event=reproduction_checked run_id=run_... reproducible=False divergence_count=1
+event=run_derived source_run_id=run_... derived_run_id=run_... basis=source+replacement_digest changes=2
+event=derivation_idempotent_replay source_run_id=run_... derived_run_id=run_... basis=source+replacement_digest
+event=descendants_listed root_run_id=run_... returned=100 truncated=True basis=page_limit
 ```
 
 手工验证（服务启动后）：
@@ -216,6 +326,11 @@ event=reproduction_checked run_id=run_... reproducible=False divergence_count=1
 ```bash
 curl -s localhost:8000/health
 curl -s -XPOST localhost:8000/experiments -H 'content-type: application/json' -d '{"name":"demo"}'
+# 等来源运行进入 succeeded 后派生：改 config 的 lr，其余沿用
+curl -s -XPOST localhost:8000/runs/run_xxx/derivations \
+  -H 'content-type: application/json' \
+  -d '{"config":{"lr":0.2},"idempotency_key":"iter-7"}'
+curl -s "localhost:8000/runs/run_xxx/descendants?limit=50"
 ```
 
 ## 存储布局

@@ -23,6 +23,7 @@ from .models import (
     ReproductionAttempt,
     Run,
     RunArtifact,
+    RunDerivation,
 )
 
 _SCHEMA = """
@@ -100,6 +101,23 @@ CREATE TABLE IF NOT EXISTS reproduction_attempts (
     attempted_at         TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_repro_run ON reproduction_attempts(run_id);
+
+CREATE TABLE IF NOT EXISTS run_derivations (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_run_id      TEXT NOT NULL REFERENCES runs(id),
+    derived_run_id     TEXT NOT NULL REFERENCES runs(id),
+    idempotency_key    TEXT,
+    replacement_digest TEXT NOT NULL,
+    replacements_json  TEXT NOT NULL DEFAULT '{}',
+    changes_json       TEXT NOT NULL DEFAULT '[]',
+    created_at         TEXT NOT NULL,
+    UNIQUE(source_run_id, replacement_digest)
+);
+CREATE INDEX IF NOT EXISTS idx_deriv_source ON run_derivations(source_run_id);
+CREATE INDEX IF NOT EXISTS idx_deriv_derived ON run_derivations(derived_run_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_deriv_derived
+    ON run_derivations(derived_run_id);
+CREATE INDEX IF NOT EXISTS idx_deriv_idem ON run_derivations(idempotency_key);
 """
 
 
@@ -453,6 +471,66 @@ class Storage:
         ).fetchall()
         return [_row_to_reproduction_attempt(row) for row in rows]
 
+    # -- derivations -------------------------------------------------------
+    def add_run_derivation(self, derivation: RunDerivation) -> RunDerivation:
+        cur = self.conn.execute(
+            """INSERT INTO run_derivations
+               (source_run_id, derived_run_id, idempotency_key, replacement_digest,
+                replacements_json, changes_json, created_at)
+               VALUES (?,?,?,?,?,?,?)""",
+            (
+                derivation.source_run_id,
+                derivation.derived_run_id,
+                derivation.idempotency_key,
+                derivation.replacement_digest,
+                derivation.replacements_json,
+                derivation.changes_json,
+                derivation.created_at,
+            ),
+        )
+        return RunDerivation(
+            id=int(cur.lastrowid),
+            source_run_id=derivation.source_run_id,
+            derived_run_id=derivation.derived_run_id,
+            idempotency_key=derivation.idempotency_key,
+            replacement_digest=derivation.replacement_digest,
+            replacements_json=derivation.replacements_json,
+            changes_json=derivation.changes_json,
+            created_at=derivation.created_at,
+        )
+
+    def get_derivation_by_replacement(
+        self, source_run_id: str, replacement_digest: str
+    ) -> RunDerivation | None:
+        row = self.conn.execute(
+            "SELECT * FROM run_derivations WHERE source_run_id = ? AND replacement_digest = ?",
+            (source_run_id, replacement_digest),
+        ).fetchone()
+        return _row_to_run_derivation(row) if row else None
+
+    def get_derivation_of_run(self, derived_run_id: str) -> RunDerivation | None:
+        row = self.conn.execute(
+            "SELECT * FROM run_derivations WHERE derived_run_id = ?",
+            (derived_run_id,),
+        ).fetchone()
+        return _row_to_run_derivation(row) if row else None
+
+    def get_derivation_by_idempotency(
+        self, source_run_id: str, idempotency_key: str
+    ) -> RunDerivation | None:
+        row = self.conn.execute(
+            "SELECT * FROM run_derivations WHERE source_run_id = ? AND idempotency_key = ?",
+            (source_run_id, idempotency_key),
+        ).fetchone()
+        return _row_to_run_derivation(row) if row else None
+
+    def direct_children(self, source_run_id: str) -> list[RunDerivation]:
+        rows = self.conn.execute(
+            "SELECT * FROM run_derivations WHERE source_run_id = ? ORDER BY id",
+            (source_run_id,),
+        ).fetchall()
+        return [_row_to_run_derivation(row) for row in rows]
+
 
 class Transaction:
     """Context manager for an explicit SQLite write transaction."""
@@ -549,4 +627,17 @@ def _row_to_reproduction_attempt(row: sqlite3.Row) -> ReproductionAttempt:
         reproducible=bool(row["reproducible"]),
         divergence_json=row["divergence_json"],
         attempted_at=row["attempted_at"],
+    )
+
+
+def _row_to_run_derivation(row: sqlite3.Row) -> RunDerivation:
+    return RunDerivation(
+        id=int(row["id"]),
+        source_run_id=row["source_run_id"],
+        derived_run_id=row["derived_run_id"],
+        idempotency_key=row["idempotency_key"],
+        replacement_digest=row["replacement_digest"],
+        replacements_json=row["replacements_json"],
+        changes_json=row["changes_json"],
+        created_at=row["created_at"],
     )

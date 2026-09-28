@@ -204,3 +204,107 @@ def test_concurrent_gc_runs_collect_once(make_service):
     assert all(a.deleted for a in service.storage.list_artifacts(include_deleted=True))
     # Blob files gone; metadata still records tombstones (no dangling refs).
     assert service.integrity_report()["healthy"] is True
+
+
+def test_concurrent_derivations_single_run(service):
+    """The same source raced with the same replacement set -> one derived run."""
+    exp = service.create_experiment(ExperimentCreate(name="e"))
+    source, _ = service.submit_run(RunCreate(
+        experiment_id=exp.id, idempotency_key="base", config={"lr": 0.1}))
+    for target in ("queued", "running", "succeeded"):
+        service.transition_run(source.id, target)
+    barrier = threading.Barrier(12)
+
+    def derive(_):
+        barrier.wait()
+        from elreg.schemas import DerivationRequest
+        return service.derive_run(
+            source.id,
+            DerivationRequest(config={"lr": 0.2}, idempotency_key="race-derive"))
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        results = list(pool.map(derive, range(12)))
+
+    run_ids = {v.derived_run_id for v, _ in results}
+    assert len(run_ids) == 1, results
+    created = sum(1 for _, c in results if c)
+    assert created == 1
+    assert len(service.list_descendants(source.id).items) == 1
+    logging.getLogger("test").info(
+        "concurrent_derivation source_run_id=%s derived_run_id=%s created=1",
+        source.id, next(iter(run_ids)),
+    )
+
+
+def test_concurrent_derivations_distinct_replacements_all_survive(service):
+    """Different replacement sets raced concurrently all get their own runs."""
+    exp = service.create_experiment(ExperimentCreate(name="e"))
+    source, _ = service.submit_run(RunCreate(
+        experiment_id=exp.id, idempotency_key="base"))
+    for target in ("queued", "running", "succeeded"):
+        service.transition_run(source.id, target)
+    barrier = threading.Barrier(8)
+
+    def derive(i):
+        barrier.wait()
+        from elreg.schemas import DerivationRequest
+        return service.derive_run(
+            source.id, DerivationRequest(config={"i": i}, idempotency_key=f"k{i}"))
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(derive, range(8)))
+
+    run_ids = {v.derived_run_id for v, _ in results}
+    assert len(run_ids) == 8
+    assert len(service.list_descendants(source.id).items) == 8
+
+
+def test_concurrent_gc_and_derivation_no_dangling(make_service):
+    """A derivation must never bind to an artifact being garbage collected."""
+    service = make_service(retention=0)
+    a, _ = service.register_artifact(b"base-bytes", ArtifactRegister(id="a@v1"))
+    g, _ = service.register_artifact(b"gc-bytes", ArtifactRegister(id="g@v1"))
+    exp = service.create_experiment(ExperimentCreate(name="e"))
+    source, _ = service.submit_run(RunCreate(
+        experiment_id=exp.id, idempotency_key="base", artifacts=["a@v1"]))
+    for target in ("queued", "running", "succeeded"):
+        service.transition_run(source.id, target)
+
+    errors: list[Exception] = []
+
+    def derive(_):
+        try:
+            from elreg.schemas import DerivationRequest
+            service.derive_run(
+                source.id,
+                DerivationRequest(artifact_replacements={"a@v1": "g@v1"}))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def collect(_):
+        try:
+            service.garbage_collect()
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        futures = []
+        for i in range(8):
+            futures.append(pool.submit(derive, i))
+            futures.append(pool.submit(collect, i))
+        for f in futures:
+            f.result()
+
+    page = service.list_descendants(source.id)
+    if page.items:
+        # If derivation won, g@v1 must still be live and referenced.
+        view = service.get_artifact("g@v1")
+        assert view.deleted is False
+        child = service.get_run(page.items[0].run_id)
+        assert child.artifacts == ["g@v1"]
+        assert errors == []
+    else:
+        # If GC won, every derivation had to be explicitly rejected.
+        assert errors
+        assert all(e.code == "artifact_deleted" for e in errors)
+    assert service.integrity_report()["healthy"] is True

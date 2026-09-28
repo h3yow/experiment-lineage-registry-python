@@ -17,6 +17,7 @@ from .errors import (
 )
 from .schemas import (
     ArtifactRegister,
+    DerivationRequest,
     ExperimentCreate,
     LineageCreate,
     MetricComparisonRequest,
@@ -52,6 +53,14 @@ _STATUS_BY_CODE = {
     "terminal_state": 409,
     "idempotency_conflict": 409,
     "idempotency_payload_mismatch": 409,
+    "derivation_idempotency_mismatch": 409,
+    "source_not_terminal": 409,
+    "replacement_source_not_found": 409,
+    "invalid_replacement": 400,
+    "derivation_not_found": 404,
+    "invalid_limit": 400,
+    "limit_exceeded": 400,
+    "invalid_cursor": 400,
     "lineage_cycle": 409,
     "cycle_detected": 409,
     "dangling_reference": 409,
@@ -142,6 +151,23 @@ def create_app(service: RegistryService) -> FastAPI:
     def attach_run_artifact(run_id: str, req: RunArtifactAttach):
         service.attach_run_artifact(run_id, req)
         return service.get_run(run_id)
+
+    # -- derivations -------------------------------------------------------
+    @app.post("/runs/{run_id}/derivations")
+    def derive_run(run_id: str, req: DerivationRequest):
+        view, created = service.derive_run(run_id, req)
+        return JSONResponse(
+            status_code=201 if created else 200,
+            content=view.model_dump(mode="json") | {"created": created},
+        )
+
+    @app.get("/runs/{run_id}/derivation")
+    def get_derivation(run_id: str):
+        return service.get_derivation(run_id)
+
+    @app.get("/runs/{run_id}/descendants")
+    def list_descendants(run_id: str, limit: int | None = None, cursor: str | None = None):
+        return service.list_descendants(run_id, limit=limit, cursor=cursor)
 
     # -- artifacts ---------------------------------------------------------
     @app.post("/artifacts", status_code=201)

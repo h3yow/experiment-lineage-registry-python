@@ -47,6 +47,8 @@ class RunView(BaseModel):
     artifacts: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
     terminal: bool = False
+    # Set when the run was created via derivation: the immediate source run.
+    derived_from: str | None = None
 
 
 class ArtifactRegister(BaseModel):
@@ -135,3 +137,59 @@ class GCResult(BaseModel):
     retained: list[dict[str, str]]
     rejected: list[dict[str, str]]
     reclaimed_bytes: int
+
+
+# -- derivations ------------------------------------------------------------
+class DerivationRequest(BaseModel):
+    # Explicit replacement of input artifact dependencies, keyed by the
+    # source-run artifact id. Anything not mentioned is inherited.
+    artifact_replacements: dict[str, str] = Field(default_factory=dict)
+    # Artifact ids to drop from the inherited input dependency set.
+    remove_artifacts: list[str] = Field(default_factory=list)
+    # Deep-merged over the source run's env / config; missing paths inherit.
+    env: dict[str, Any] = Field(default_factory=dict)
+    config: dict[str, Any] = Field(default_factory=dict)
+    idempotency_key: str | None = None
+
+
+class InputChange(BaseModel):
+    category: str          # env | config | artifact
+    op: str                # added | removed | replaced
+    key: str               # dotted path (env/config) or artifact id
+    source_value: Any = None
+    derived_value: Any = None
+
+
+class DerivationView(BaseModel):
+    id: int
+    source_run_id: str
+    derived_run_id: str
+    idempotency_key: str | None
+    replacement_digest: str
+    # Exactly what was asked for (normalized replacement set).
+    replacements: dict[str, Any] = Field(default_factory=dict)
+    # Itemized added/removed/replaced inputs after inheritance.
+    changes: list[InputChange] = Field(default_factory=list)
+    created: bool = True
+    created_at: str
+
+
+class DescendantItem(BaseModel):
+    run_id: str
+    source_run_id: str
+    depth: int
+    derivation_id: int
+    created_at: str
+
+
+class DescendantPage(BaseModel):
+    root_run_id: str
+    items: list[DescendantItem] = Field(default_factory=list)
+    limit: int
+    offset: int
+    returned: int
+    # True when the scan hit the hard traversal cap or more rows remain.
+    truncated: bool = False
+    truncation_reason: str | None = None  # scan_cap | page_limit | null
+    next_offset: int | None = None
+    next_cursor: str | None = None
