@@ -135,3 +135,56 @@ class GCResult(BaseModel):
     retained: list[dict[str, str]]
     rejected: list[dict[str, str]]
     reclaimed_bytes: int
+
+
+# -- derivation -------------------------------------------------------------
+class ArtifactReplacement(BaseModel):
+    artifact_id: str       # dependency of the source run being replaced
+    replacement_id: str    # live artifact that takes its place
+
+
+class DeriveRunCreate(BaseModel):
+    # Client-supplied identity token; scoped per source run. Same key with a
+    # different replacement request is rejected (409), never silently forked.
+    idempotency_key: str | None = None
+    # By default the child belongs to the source run's experiment.
+    experiment_id: str | None = None
+    env_overrides: dict[str, Any] = Field(default_factory=dict)
+    config_overrides: dict[str, Any] = Field(default_factory=dict)
+    env_remove: list[str] = Field(default_factory=list)
+    config_remove: list[str] = Field(default_factory=list)
+    add_artifacts: list[str] = Field(default_factory=list)
+    remove_artifacts: list[str] = Field(default_factory=list)
+    replace_artifacts: list[ArtifactReplacement] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class DerivationView(BaseModel):
+    id: int
+    parent_run_id: str
+    run_id: str
+    idempotency_key: str | None
+    request: dict[str, Any]
+    changes: list[dict[str, Any]] = Field(default_factory=list)
+    derived_at: str
+
+
+class DeriveRunResult(BaseModel):
+    run: RunView
+    derivation: DerivationView
+    created: bool
+
+
+class DescendantsPage(BaseModel):
+    run_id: str
+    descendants: list[RunView]
+    next_cursor: str | None = None
+    truncated: bool = False
+    limit: int
+
+
+class AncestorsPage(BaseModel):
+    run_id: str
+    ancestors: list[RunView]
+    truncated: bool = False
+    limit: int

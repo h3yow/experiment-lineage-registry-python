@@ -22,6 +22,8 @@ def build_settings(
     policy: str = "reject",
     gc_on_overflow: bool = False,
     wait: float = 1.0,
+    derivation_default_limit: int = 100,
+    derivation_max_limit: int = 1000,
     log_level: str = "INFO",
 ) -> Settings:
     return Settings(
@@ -33,6 +35,8 @@ def build_settings(
         capacity_policy=policy,
         gc_on_overflow=gc_on_overflow,
         capacity_wait_timeout_seconds=wait,
+        derivation_default_limit=derivation_default_limit,
+        derivation_max_limit=derivation_max_limit,
         log_level=log_level,
     )
 

@@ -63,5 +63,9 @@ class CapacityDelayedError(RegistryError):
     code = "capacity_delayed"
 
 
+class DerivationError(RegistryError):
+    code = "derivation_error"
+
+
 class ConfigError(RegistryError):
     code = "config_error"

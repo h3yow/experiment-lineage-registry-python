@@ -8,6 +8,7 @@ written before the metadata commit.
 
 from __future__ import annotations
 
+import base64
 import json
 import threading
 import uuid
@@ -16,11 +17,13 @@ from pathlib import Path
 from typing import Any
 
 from .config import Settings
+from . import derivation as derive_logic
 from .errors import (
     CapacityDelayedError,
     CapacityRejectedError,
     ConflictError,
     DanglingReferenceError,
+    DerivationError,
     IdempotencyConflictError,
     InvalidTransitionError,
     LineageCycleError,
@@ -48,10 +51,16 @@ from .models import (
     TERMINAL_STATES,
     Run,
     RunArtifact,
+    RunDerivation,
 )
 from .schemas import (
+    AncestorsPage,
     ArtifactRegister,
     ArtifactView,
+    DescendantsPage,
+    DerivationView,
+    DeriveRunCreate,
+    DeriveRunResult,
     ExperimentCreate,
     ExperimentView,
     GCResult,
@@ -1000,6 +1009,366 @@ class RegistryService:
             "orphan_blobs": orphan_blobs,
             "healthy": not dangling,
         }
+
+    # ======================================================================
+    # Run derivation: branch a new run from a terminal source run
+    # ======================================================================
+    def derive_run(
+        self, parent_run_id: str, req: DeriveRunCreate
+    ) -> DeriveRunResult:
+        with self._lock:
+            parent = self._require_run(parent_run_id)
+            # Only a finished run is a stable starting point for branching.
+            if parent.state not in TERMINAL_STATES:
+                raise DerivationError(
+                    f"source run {parent.id!r} is in state {parent.state!r}; "
+                    "only terminal runs (succeeded/failed/canceled) can be "
+                    "used as derivation sources",
+                    code="source_run_not_terminal",
+                )
+
+            experiment_id = req.experiment_id or parent.experiment_id
+            if self.storage.get_experiment(experiment_id) is None:
+                raise NotFoundError(
+                    f"experiment {experiment_id!r} not found",
+                    code="experiment_not_found",
+                )
+
+            source_input_artifacts = sorted(
+                ref.artifact_id
+                for ref in self.storage.artifacts_of_run(parent.id)
+                if ref.role == "input"
+            )
+            add_ids = list(req.add_artifacts)
+            remove_ids = list(req.remove_artifacts)
+            replace_pairs_req = [
+                {"artifact_id": e.artifact_id, "replacement_id": e.replacement_id}
+                for e in req.replace_artifacts
+            ]
+
+            # Structural validation (dependency-set consistency).
+            try:
+                add_set, remove_set, replace_pairs = derive_logic.validate_artifact_plan(
+                    source_input_artifacts,
+                    add_ids,
+                    remove_ids,
+                    replace_pairs_req,
+                )
+            except derive_logic.DerivationSpecError as exc:
+                raise DerivationError(str(exc), code="invalid_derivation") from exc
+
+            # Every effective target must exist AND be live: a derivation may
+            # never point at an artifact that is missing or being collected.
+            target_ids = sorted(add_set | set(replace_pairs.values()))
+            if target_ids:
+                self._assert_all_live_artifacts(target_ids)
+
+            source_env = _loads(parent.env_json)
+            source_config = _loads(parent.config_json)
+            try:
+                result_env = derive_logic.apply_document(
+                    source_env, req.env_overrides, req.env_remove
+                )
+                result_config = derive_logic.apply_document(
+                    source_config, req.config_overrides, req.config_remove
+                )
+            except derive_logic.DerivationSpecError as exc:
+                raise DerivationError(str(exc), code="invalid_derivation") from exc
+
+            result_artifact_ids = (
+                (set(source_input_artifacts) - remove_set - set(replace_pairs))
+                | add_set
+                | set(replace_pairs.values())
+            )
+
+            canonical = derive_logic.canonical_request(
+                req.env_overrides,
+                req.config_overrides,
+                req.env_remove,
+                req.config_remove,
+                add_ids,
+                remove_ids,
+                replace_pairs_req,
+                experiment_id,
+            )
+            request_hash = derive_logic.hash_derivation_request(canonical)
+
+            # Identity rules:
+            # * same parent + same key but different content -> explicit reject
+            # * same parent + same content (any key) -> the same child run
+            if req.idempotency_key is not None:
+                keyed = self.storage.get_derivation_by_key(
+                    parent.id, req.idempotency_key
+                )
+                if keyed is not None:
+                    if keyed.request_hash != request_hash:
+                        log.info(
+                            "run_derivation_conflict",
+                            extra={
+                                "kv": {
+                                    "parent_run_id": parent.id,
+                                    "child_run_id": keyed.run_id,
+                                    "idempotency_key": req.idempotency_key,
+                                    "reason": "payload_mismatch",
+                                }
+                            },
+                        )
+                        raise IdempotencyConflictError(
+                            f"derivation idempotency key {req.idempotency_key!r} "
+                            f"already used by run {keyed.run_id!r} for source "
+                            f"{parent.id!r} with different replacements",
+                            code="derivation_payload_mismatch",
+                        )
+                    same = keyed
+                else:
+                    same = self.storage.get_derivation_by_hash(parent.id, request_hash)
+            else:
+                same = self.storage.get_derivation_by_hash(parent.id, request_hash)
+
+            if same is not None:
+                log.info(
+                    "run_derivation_idempotent_replay",
+                    extra={
+                        "kv": {
+                            "parent_run_id": parent.id,
+                            "child_run_id": same.run_id,
+                            "request_hash": request_hash[:12],
+                        }
+                    },
+                )
+                return self._derivation_result(same, created=False)
+
+            changes = derive_logic.compute_changes(
+                source_env,
+                result_env,
+                source_config,
+                result_config,
+                source_input_artifacts,
+                sorted(result_artifact_ids),
+                replace_pairs,
+            )
+            result_shas = self._resolve_artifact_shas(sorted(result_artifact_ids))
+            fingerprint = fingerprint_run_inputs(
+                result_env, result_config, result_shas
+            )
+            now = _utcnow()
+            child_id = _new_id("run")
+            child = Run(
+                id=child_id,
+                experiment_id=experiment_id,
+                # The derivation key lives on the derivation record; the child
+                # run itself is not retrievable through run idempotency.
+                idempotency_key=None,
+                state="created",
+                created_at=now,
+                updated_at=now,
+                env_json=canonicalize(result_env).decode("utf-8"),
+                config_json=canonicalize(result_config).decode("utf-8"),
+                fingerprint=fingerprint,
+                metadata_json=canonicalize(req.metadata).decode("utf-8"),
+            )
+            record = RunDerivation(
+                id=0,
+                parent_run_id=parent.id,
+                run_id=child_id,
+                idempotency_key=req.idempotency_key,
+                request_hash=request_hash,
+                request_json=canonicalize(canonical).decode("utf-8"),
+                changes_json=canonicalize(changes).decode("utf-8"),
+                derived_at=now,
+            )
+            # Child run + references + derivation record commit atomically:
+            # a rejected derivation never leaves a half-created run behind.
+            with self.storage.begin():
+                self.storage.create_run(child)
+                for artifact_id in sorted(result_artifact_ids):
+                    self.storage.add_run_artifact(
+                        RunArtifact(
+                            run_id=child_id,
+                            artifact_id=artifact_id,
+                            role="input",
+                            registered_at=now,
+                        )
+                    )
+                record = self.storage.create_derivation(record)
+            log.info(
+                "run_derived",
+                extra={
+                    "kv": {
+                        "parent_run_id": parent.id,
+                        "child_run_id": child_id,
+                        "request_hash": request_hash[:12],
+                        "fingerprint": fingerprint[:12],
+                        "change_count": len(changes),
+                    }
+                },
+            )
+            return self._derivation_result(record, created=True)
+
+    def _assert_all_live_artifacts(self, artifact_ids: list[str]) -> None:
+        missing: list[str] = []
+        deleted: list[str] = []
+        for artifact_id in artifact_ids:
+            artifact = self.storage.get_artifact(artifact_id)
+            if artifact is None:
+                missing.append(artifact_id)
+            elif artifact.deleted:
+                deleted.append(artifact_id)
+        if missing:
+            raise DanglingReferenceError(
+                f"derivation targets do not exist: {sorted(missing)}",
+                code="artifact_not_found",
+            )
+        if deleted:
+            raise DanglingReferenceError(
+                f"derivation targets have been garbage collected: {sorted(deleted)}",
+                code="artifact_deleted",
+            )
+
+    def get_derivation(self, run_id: str) -> DerivationView:
+        with self._lock:
+            self._require_run(run_id)
+            record = self.storage.get_derivation_of_run(run_id)
+            if record is None:
+                raise NotFoundError(
+                    f"run {run_id!r} was not created by derivation",
+                    code="derivation_not_found",
+                )
+            return self._derivation_view(record)
+
+    def list_direct_children(self, run_id: str) -> list[DerivationView]:
+        with self._lock:
+            self._require_run(run_id)
+            return [
+                self._derivation_view(record)
+                for record in self.storage.direct_children(run_id)
+            ]
+
+    def list_descendants(
+        self, run_id: str, *, limit: int | None = None, cursor: str | None = None
+    ) -> DescendantsPage:
+        with self._lock:
+            self._require_run(run_id)
+            page_limit = self._bounded_page_limit(limit)
+            offset = self._decode_cursor(cursor)
+
+            # Level-order traversal (stable: each level ordered by derivation
+            # id). Enumerate one node past the window to detect truncation.
+            order: list[str] = []
+            frontier = [run_id]
+            visited = {run_id}
+            need = offset + page_limit + 1
+            while frontier and len(order) < need:
+                next_frontier: list[str] = []
+                for parent_id in frontier:
+                    for record in self.storage.direct_children(parent_id):
+                        if record.run_id in visited:
+                            continue
+                        visited.add(record.run_id)
+                        next_frontier.append(record.run_id)
+                        if len(order) < need:
+                            order.append(record.run_id)
+                frontier = next_frontier
+
+            window = order[offset : offset + page_limit]
+            truncated = len(order) > offset + page_limit
+            next_cursor: str | None = None
+            if truncated:
+                next_cursor = self._encode_cursor(offset + len(window))
+            return DescendantsPage(
+                run_id=run_id,
+                descendants=[self._run_view(self._require_run(rid)) for rid in window],
+                next_cursor=next_cursor,
+                truncated=truncated,
+                limit=page_limit,
+            )
+
+    def list_ancestors(self, run_id: str, *, limit: int | None = None) -> AncestorsPage:
+        with self._lock:
+            self._require_run(run_id)
+            page_limit = self._bounded_page_limit(limit)
+            ancestors: list[Run] = []
+            current_id = run_id
+            truncated = False
+            # Each run has at most one derivation parent: the chain is linear.
+            while True:
+                record = self.storage.get_derivation_of_run(current_id)
+                if record is None:
+                    break
+                parent = self.storage.get_run(record.parent_run_id)
+                if parent is None:
+                    break
+                if len(ancestors) >= page_limit:
+                    truncated = True
+                    break
+                ancestors.append(parent)
+                current_id = parent.id
+            return AncestorsPage(
+                run_id=run_id,
+                ancestors=[self._run_view(run) for run in ancestors],
+                truncated=truncated,
+                limit=page_limit,
+            )
+
+    def _bounded_page_limit(self, limit: int | None) -> int:
+        if limit is None:
+            return self.settings.derivation_default_limit
+        if not isinstance(limit, int) or limit < 1:
+            raise ConflictError(
+                f"limit must be a positive integer, got {limit!r}",
+                code="invalid_pagination_limit",
+            )
+        if limit > self.settings.derivation_max_limit:
+            raise ConflictError(
+                f"limit {limit} exceeds hard maximum "
+                f"{self.settings.derivation_max_limit}",
+                code="pagination_limit_exceeded",
+            )
+        return limit
+
+    @staticmethod
+    def _encode_cursor(offset: int) -> str:
+        raw = json.dumps({"offset": offset}, separators=(",", ":")).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("ascii")
+
+    @staticmethod
+    def _decode_cursor(cursor: str | None) -> int:
+        if cursor is None:
+            return 0
+        try:
+            raw = base64.urlsafe_b64decode(cursor.encode("ascii"))
+            payload = json.loads(raw)
+            offset = int(payload["offset"])
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise ConflictError(
+                f"invalid pagination cursor {cursor!r}",
+                code="invalid_cursor",
+            ) from exc
+        if offset < 0:
+            raise ConflictError(
+                "invalid pagination cursor: negative offset", code="invalid_cursor"
+            )
+        return offset
+
+    def _derivation_view(self, record: RunDerivation) -> DerivationView:
+        return DerivationView(
+            id=record.id,
+            parent_run_id=record.parent_run_id,
+            run_id=record.run_id,
+            idempotency_key=record.idempotency_key,
+            request=_loads(record.request_json),
+            changes=_loads(record.changes_json),
+            derived_at=record.derived_at,
+        )
+
+    def _derivation_result(
+        self, record: RunDerivation, *, created: bool
+    ) -> DeriveRunResult:
+        return DeriveRunResult(
+            run=self._run_view(self._require_run(record.run_id)),
+            derivation=self._derivation_view(record),
+            created=created,
+        )
 
     # ======================================================================
     # Internal helpers

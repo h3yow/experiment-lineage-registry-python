@@ -101,3 +101,22 @@ class ReproductionAttempt:
     reproducible: bool
     divergence_json: str
     attempted_at: str
+
+
+@dataclass
+class RunDerivation:
+    """One derivation record: ``run_id`` was derived from ``parent_run_id``.
+
+    ``request_json`` holds the canonicalized replacement request (so every
+    derivation can be reverse-traced to its source and to exactly what was
+    replaced); ``request_hash`` is its digest and is unique per parent.
+    """
+
+    id: int
+    parent_run_id: str
+    run_id: str
+    idempotency_key: str | None
+    request_hash: str
+    request_json: str
+    changes_json: str
+    derived_at: str

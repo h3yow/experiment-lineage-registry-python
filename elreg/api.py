@@ -25,6 +25,7 @@ from .schemas import (
     RunArtifactAttach,
     RunCreate,
     RunTransition,
+    DeriveRunCreate,
 )
 from .service import RegistryService
 
@@ -73,6 +74,14 @@ _STATUS_BY_CODE = {
     "capacity_exceeded_no_evictable": 507,
     "capacity_delayed": 503,
     "capacity_wait_timeout": 503,
+    "derivation_error": 409,
+    "source_run_not_terminal": 409,
+    "invalid_derivation": 400,
+    "derivation_payload_mismatch": 409,
+    "derivation_not_found": 404,
+    "invalid_pagination_limit": 400,
+    "pagination_limit_exceeded": 400,
+    "invalid_cursor": 400,
     "invalid_config": 500,
 }
 
@@ -142,6 +151,33 @@ def create_app(service: RegistryService) -> FastAPI:
     def attach_run_artifact(run_id: str, req: RunArtifactAttach):
         service.attach_run_artifact(run_id, req)
         return service.get_run(run_id)
+
+    # -- derivation --------------------------------------------------------
+    @app.post("/runs/{run_id}/derive")
+    def derive_run(run_id: str, req: DeriveRunCreate):
+        result = service.derive_run(run_id, req)
+        return JSONResponse(
+            status_code=201 if result.created else 200,
+            content=result.model_dump(),
+        )
+
+    @app.get("/runs/{run_id}/derivation")
+    def get_derivation(run_id: str):
+        return service.get_derivation(run_id)
+
+    @app.get("/runs/{run_id}/children")
+    def list_direct_children(run_id: str):
+        return service.list_direct_children(run_id)
+
+    @app.get("/runs/{run_id}/descendants")
+    def list_descendants(
+        run_id: str, limit: int | None = None, cursor: str | None = None
+    ):
+        return service.list_descendants(run_id, limit=limit, cursor=cursor)
+
+    @app.get("/runs/{run_id}/ancestors")
+    def list_ancestors(run_id: str, limit: int | None = None):
+        return service.list_ancestors(run_id, limit=limit)
 
     # -- artifacts ---------------------------------------------------------
     @app.post("/artifacts", status_code=201)

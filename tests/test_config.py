@@ -48,3 +48,35 @@ def test_valid_overrides(monkeypatch):
     assert settings.capacity_policy == "evict-oldest"
     assert settings.gc_on_overflow is False
     assert settings.log_level == "DEBUG"
+
+
+def test_derivation_limit_defaults(monkeypatch):
+    settings = load_settings()
+    assert settings.derivation_default_limit == 100
+    assert settings.derivation_max_limit == 1000
+
+
+@pytest.mark.parametrize(
+    ("default", "maximum"),
+    [
+        ("0", "1000"),
+        ("-1", "1000"),
+        ("100", "0"),
+        ("100", "x"),
+        ("500", "100"),
+    ],
+)
+def test_derivation_limits_validated_at_load(monkeypatch, default, maximum):
+    monkeypatch.setenv("ELR_DERIVATION_DEFAULT_LIMIT", default)
+    monkeypatch.setenv("ELR_DERIVATION_MAX_LIMIT", maximum)
+    with pytest.raises(ConfigError) as exc:
+        load_settings()
+    assert exc.value.code == "invalid_config"
+
+
+def test_derivation_limits_valid_override(monkeypatch):
+    monkeypatch.setenv("ELR_DERIVATION_DEFAULT_LIMIT", "10")
+    monkeypatch.setenv("ELR_DERIVATION_MAX_LIMIT", "50")
+    settings = load_settings()
+    assert settings.derivation_default_limit == 10
+    assert settings.derivation_max_limit == 50
