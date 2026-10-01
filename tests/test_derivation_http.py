@@ -50,7 +50,14 @@ def test_derive_http_key_conflict_409(client):
     resp = client.post(f"/runs/{source['id']}/derivations",
                        json={"config": {"lr": 0.9}, "idempotency_key": "k"})
     assert resp.status_code == 409
-    assert resp.json()["error"]["code"] == "derivation_idempotency_mismatch"
+    body = resp.json()
+    assert body["error"]["code"] == "derivation_idempotency_mismatch"
+    # The conflict must name the commit id, the source run and the exact
+    # diverging input leaf rather than a generic message.
+    message = body["error"]["message"]
+    assert "'k'" in message
+    assert source["id"] in message
+    assert "'lr'" in message
 
 
 def test_derive_http_non_terminal_409(client):

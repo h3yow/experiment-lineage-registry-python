@@ -10,10 +10,13 @@ observe a partially written blob.
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger("elreg.storage")
 
 from .models import (
     Artifact,
@@ -118,6 +121,12 @@ CREATE INDEX IF NOT EXISTS idx_deriv_derived ON run_derivations(derived_run_id);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_deriv_derived
     ON run_derivations(derived_run_id);
 CREATE INDEX IF NOT EXISTS idx_deriv_idem ON run_derivations(idempotency_key);
+/* Cross-process commit identity: one (source run, commit id) pair only.
+   NULL keys are excluded so keyless, content-deduped derivations (which may
+   coexist with other digests) remain untouched. */
+CREATE UNIQUE INDEX IF NOT EXISTS uq_deriv_source_idem
+    ON run_derivations(source_run_id, idempotency_key)
+    WHERE idempotency_key IS NOT NULL;
 """
 
 
@@ -142,7 +151,57 @@ class Storage:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute("PRAGMA busy_timeout=30000")
         self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._migrate_derivation_commit_uniqueness()
         self._conn.executescript(_SCHEMA)
+
+    def _migrate_derivation_commit_uniqueness(self) -> None:
+        """Prepare for uq_deriv_source_idem on databases written by older code.
+
+        Before the commit-id uniqueness was enforced at the storage layer, two
+        derivations could be persisted for one (source_run_id,
+        idempotency_key) pair. Such rows would make creating the unique
+        partial index fail. Keep the first registration per pair, drop the
+        duplicate derivation row and its derivation lineage edge; the
+        duplicate derived run itself is left untouched (no user data is
+        deleted) and the cleanup is logged.
+        """
+        conn = self.conn
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='run_derivations'"
+        ).fetchone()
+        if exists is None:
+            # Fresh database: _SCHEMA (including the unique partial index) is
+            # created right after this migration hook.
+            return
+        dupes = conn.execute(
+            """SELECT source_run_id, idempotency_key,
+                      GROUP_CONCAT(id) AS ids, COUNT(*) AS n
+                 FROM run_derivations
+                WHERE idempotency_key IS NOT NULL
+             GROUP BY source_run_id, idempotency_key
+               HAVING n > 1"""
+        ).fetchall()
+        if not dupes:
+            return
+        for row in dupes:
+            ids = [int(x) for x in row["ids"].split(",")]
+            keep_id, drop_ids = ids[0], ids[1:]
+            for drop_id in drop_ids:
+                conn.execute(
+                    """DELETE FROM lineage_edges
+                        WHERE relation = 'derived_from'
+                          AND upstream_run_id = ?
+                          AND downstream_run_id =
+                              (SELECT derived_run_id FROM run_derivations WHERE id = ?)""",
+                    (row["source_run_id"], drop_id),
+                )
+                conn.execute("DELETE FROM run_derivations WHERE id = ?", (drop_id,))
+            log.warning(
+                "derivation_commit_id_deduped source_run_id=%s idempotency_key=%s "
+                "kept_derivation_id=%s dropped_derivation_ids=%s",
+                row["source_run_id"], row["idempotency_key"], keep_id,
+                ",".join(str(i) for i in drop_ids),
+            )
 
     @property
     def conn(self) -> sqlite3.Connection:

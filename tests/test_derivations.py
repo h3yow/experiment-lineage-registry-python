@@ -131,13 +131,38 @@ def test_equivalent_requests_dedupe_without_idempotency_key(service):
 def test_same_key_different_replacements_rejected(service):
     exp = _experiment(service)
     source = _terminal_run(service, exp, config={"lr": 0.1})
-    service.derive_run(source.id, DerivationRequest(
+    winner, _ = service.derive_run(source.id, DerivationRequest(
         config={"lr": 0.2}, idempotency_key="k"))
     with pytest.raises(IdempotencyConflictError) as exc:
         service.derive_run(source.id, DerivationRequest(
             config={"lr": 0.9}, idempotency_key="k"))
     assert exc.value.code == "derivation_idempotency_mismatch"
+    message = str(exc.value)
+    # Names the commit id, the source, the winning run and the exact input.
+    assert "'k'" in message
+    assert source.id in message
+    assert winner.derived_run_id in message
+    assert "'lr'" in message
     # No silent second run.
+    assert len(service.list_descendants(source.id).items) == 1
+
+
+def test_same_key_different_artifact_replacement_names_the_input(service):
+    """An artifact-level conflict names the offending input artifact id."""
+    exp = _experiment(service)
+    a = _artifact(service, b"aaaa", "a@v1")
+    b = _artifact(service, b"bbbb", "b@v1")
+    c = _artifact(service, b"cccc", "c@v1")
+    source = _terminal_run(service, exp, artifacts=[a])
+    service.derive_run(source.id, DerivationRequest(
+        artifact_replacements={"a@v1": "b@v1"}, idempotency_key="k"))
+    with pytest.raises(IdempotencyConflictError) as exc:
+        service.derive_run(source.id, DerivationRequest(
+            artifact_replacements={"a@v1": "c@v1"}, idempotency_key="k"))
+    assert exc.value.code == "derivation_idempotency_mismatch"
+    message = str(exc.value)
+    assert "'k'" in message and source.id in message
+    assert "a@v1" in message and "b@v1" in message and "c@v1" in message
     assert len(service.list_descendants(source.id).items) == 1
 
 

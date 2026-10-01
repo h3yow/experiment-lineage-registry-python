@@ -451,6 +451,9 @@ class RegistryService:
             )
 
             # --- idempotency / content-based dedupe ------------------------
+            # Fast path (process-local). The authoritative re-check happens
+            # inside the write transaction below, so two *processes* sharing
+            # this database cannot both pass this check.
             existing = self.storage.get_derivation_by_replacement(source.id, digest)
             if existing is not None:
                 if (
@@ -458,7 +461,7 @@ class RegistryService:
                     and existing.idempotency_key is not None
                     and existing.idempotency_key != req.idempotency_key
                 ):
-                    self._derivation_key_conflict(existing, req)
+                    self._derivation_commit_conflict(existing, req, digest)
                 log.info(
                     "derivation_idempotent_replay",
                     extra={"kv": {"source_run_id": source.id,
@@ -472,7 +475,7 @@ class RegistryService:
                     source.id, req.idempotency_key
                 )
                 if by_key is not None and by_key.replacement_digest != digest:
-                    self._derivation_key_conflict(by_key, req)
+                    self._derivation_commit_conflict(by_key, req, digest)
 
             # --- create the derived run, record and lineage edge atomically
             derived_shas = [
@@ -520,35 +523,83 @@ class RegistryService:
             )
             try:
                 with self.storage.begin():
-                    self.storage.create_run(derived_run)
-                    for artifact_id in derived_ids:
-                        self.storage.add_run_artifact(
-                            RunArtifact(
-                                run_id=derived_run.id,
-                                artifact_id=artifact_id,
-                                role="input",
-                                registered_at=now,
+                    # Authoritative dedupe inside the write lock: another
+                    # *process* may have committed between our fast-path read
+                    # and now. BEGIN IMMEDIATE serializes the two writers.
+                    raced = self.storage.get_derivation_by_replacement(
+                        source.id, digest
+                    )
+                    if raced is not None:
+                        if (
+                            req.idempotency_key is not None
+                            and raced.idempotency_key is not None
+                            and raced.idempotency_key != req.idempotency_key
+                        ):
+                            self._derivation_commit_conflict(raced, req, digest)
+                        # Identical content raced first: converge on the
+                        # winner; the transaction commits empty, nothing of
+                        # ours is written.
+                        winner = self._derivation_view(raced, created=False)
+                    else:
+                        winner = None
+                        if req.idempotency_key is not None:
+                            by_key = self.storage.get_derivation_by_idempotency(
+                                source.id, req.idempotency_key
                             )
-                        )
-                    record = self.storage.add_run_derivation(record)
-                    if not self.storage.lineage_edge_exists(
-                        edge.upstream_run_id, edge.downstream_run_id, edge.relation
-                    ):
-                        self.storage.add_lineage_edge(edge)
+                            if by_key is not None:
+                                # Same commit id raced with *different*
+                                # replacement content: reject and roll back.
+                                self._derivation_commit_conflict(by_key, req, digest)
+
+                        self.storage.create_run(derived_run)
+                        for artifact_id in derived_ids:
+                            self.storage.add_run_artifact(
+                                RunArtifact(
+                                    run_id=derived_run.id,
+                                    artifact_id=artifact_id,
+                                    role="input",
+                                    registered_at=now,
+                                )
+                            )
+                        record = self.storage.add_run_derivation(record)
+                        if not self.storage.lineage_edge_exists(
+                            edge.upstream_run_id, edge.downstream_run_id, edge.relation
+                        ):
+                            self.storage.add_lineage_edge(edge)
             except sqlite3.IntegrityError:
-                # Cross-process race (multiple workers): another writer
-                # already committed this (source, replacement_digest). The
-                # transaction is rolled back; converge on the existing run.
-                winner = self.storage.get_derivation_by_replacement(source.id, digest)
-                if winner is not None:
+                # Belt-and-braces for races the recheck cannot see (e.g. two
+                # writers committing in the gap on some SQLite builds): tell
+                # apart *which* uniqueness guarantee fired.
+                by_key = (
+                    self.storage.get_derivation_by_idempotency(
+                        source.id, req.idempotency_key
+                    )
+                    if req.idempotency_key is not None
+                    else None
+                )
+                if (
+                    by_key is not None
+                    and by_key.replacement_digest != digest
+                ):
+                    self._derivation_commit_conflict(by_key, req, digest)
+                winner_rec = self.storage.get_derivation_by_replacement(source.id, digest)
+                if winner_rec is not None:
                     log.info(
                         "derivation_idempotent_replay",
                         extra={"kv": {"source_run_id": source.id,
-                                      "derived_run_id": winner.derived_run_id,
+                                      "derived_run_id": winner_rec.derived_run_id,
                                       "basis": "unique_constraint_recovery"}},
                     )
-                    return self._derivation_view(winner, created=False), False
+                    return self._derivation_view(winner_rec, created=False), False
                 raise
+            if winner is not None:
+                log.info(
+                    "derivation_idempotent_replay",
+                    extra={"kv": {"source_run_id": source.id,
+                                  "derived_run_id": winner.derived_run_id,
+                                  "basis": "in_transaction_recheck"}},
+                )
+                return winner, False
             log.info(
                 "run_derived",
                 extra={
@@ -603,17 +654,85 @@ class RegistryService:
                 code="invalid_replacement",
             )
 
-    def _derivation_key_conflict(self, existing: RunDerivation, req: DerivationRequest) -> None:
+    def _replacement_divergence(
+        self, existing: RunDerivation, req: DerivationRequest
+    ) -> list[str]:
+        """Itemize how *req* differs from the replacement set already committed
+        under the same (source run, commit id) pair.
+
+        Every item names the exact input category and key/path that diverged,
+        so a rejected caller knows precisely what to fix.
+        """
+        prior = _loads(existing.replacements_json)
+        prior_repl: dict[str, str] = dict(prior.get("artifact_replacements", {}))
+        prior_remove = set(prior.get("remove_artifacts", []))
+        prior_env = prior.get("env", {})
+        prior_config = prior.get("config", {})
+
+        items: list[str] = []
+        req_repl = dict(req.artifact_replacements)
+        for key in sorted(set(prior_repl) | set(req_repl)):
+            if prior_repl.get(key) != req_repl.get(key) or (
+                key in prior_repl
+            ) != (key in req_repl):
+                items.append(
+                    f"artifact replacement for input {key!r}: "
+                    f"committed target {prior_repl.get(key)!r} vs "
+                    f"rejected target {req_repl.get(key)!r}"
+                )
+        req_remove = set(req.remove_artifacts)
+        for aid in sorted(prior_remove ^ req_remove):
+            if aid in prior_remove:
+                items.append(
+                    f"removed input {aid!r}: committed for removal but absent "
+                    f"from rejected request"
+                )
+            else:
+                items.append(
+                    f"removed input {aid!r}: not removed in committed set but "
+                    f"requested for removal in rejected request"
+                )
+        for category, prior_patch, req_patch in (
+            ("env", prior_env, req.env),
+            ("config", prior_config, req.config),
+        ):
+            for change in deriv.diff_section(category, prior_patch, req_patch):
+                items.append(
+                    f"{category} input {change['key']!r}: "
+                    f"committed value {change['source_value']!r} vs "
+                    f"rejected value {change['derived_value']!r}"
+                )
+        if not items:
+            # Canonically equal payloads should have produced the same digest;
+            # keep a distinguishable message rather than a silent mismatch.
+            items.append("replacement sets differ after canonical normalization")
+        return items
+
+    def _derivation_commit_conflict(
+        self, existing: RunDerivation, req: DerivationRequest, digest: str
+    ) -> None:
+        key = req.idempotency_key
+        divergence = self._replacement_divergence(existing, req)
+        detail = "; ".join(divergence)
         log.info(
-            "derivation_idempotency_conflict",
-            extra={"kv": {"source_run_id": existing.source_run_id,
-                          "derived_run_id": existing.derived_run_id,
-                          "basis": "idempotency_key"}},
+            "derivation_commit_conflict",
+            extra={
+                "kv": {
+                    "source_run_id": existing.source_run_id,
+                    "winner_derived_run_id": existing.derived_run_id,
+                    "idempotency_key": key or "",
+                    "winner_digest": existing.replacement_digest[:12],
+                    "rejected_digest": digest[:12],
+                    "diverging_inputs": str(len(divergence)),
+                }
+            },
         )
         raise IdempotencyConflictError(
-            f"derivation idempotency key {req.idempotency_key!r} already used for "
-            f"source run {existing.source_run_id!r} by derived run "
-            f"{existing.derived_run_id!r} with a different replacement set",
+            f"derivation commit id {key!r} is already bound to derived run "
+            f"{existing.derived_run_id!r} for source run "
+            f"{existing.source_run_id!r}, but the replacement content differs; "
+            f"a commit id maps to exactly one replacement set per source run. "
+            f"Diverging input(s): {detail}",
             code="derivation_idempotency_mismatch",
         )
 

@@ -10,7 +10,7 @@
 uv sync
 uv run uvicorn main:app --reload          # 与原始骨架相同的启动方式
 # 或
-uv run pytest                              # 运行全部测试（132 个用例）
+uv run pytest                              # 运行全部测试（149 个用例）
 ```
 
 服务默认把数据写入 `.elreg-data/`（`registry.db` + `artifacts/`）。
@@ -99,20 +99,55 @@ created ──► queued ──► running ──► succeeded  (终态)
   原样继承；不是整体覆盖。
 * 不支持对非终态运行派生 → `409 source_not_terminal`。
 
-### 派生身份与幂等
+### 派生身份与提交标识（commit id）唯一性
 
-* 服务端对“来源运行 + 规范化后的替换集合”计算 `replacement_digest`，
-  `(source_run_id, replacement_digest)` 唯一：**同一来源 + 同一套替换内容
-  重复提交，永远落到同一个派生运行**（首次 `201 created=true`，重放
-  `200 created=false`），即使不带 `idempotency_key` 也一样。
-* 带了 `idempotency_key` 时：键相同但替换内容对不上 →
-  `409 derivation_idempotency_mismatch`，**绝不悄悄产生第二个运行**。
-* 幂等作用域是“来源运行”：不同来源可复用同一键。
+派生的身份由**两层相互独立的唯一约束**共同确定，且两层都直接落在
+SQLite 上（而不是进程内判断），因此在**多个服务实例 / 多个进程同时打开
+同一份本地数据目录**时同样成立：
+
+1. **替换内容身份 `(source_run_id, replacement_digest)`**：服务端对
+   “来源运行 + 规范化后的替换集合”计算 `replacement_digest`。同一来源 +
+   同一套替换内容重复提交（含并发、跨进程、不带提交标识），永远落到
+   **同一个派生运行**（首次 `201 created=true`，重放
+   `200 created=false`）。不同提交标识只要替换内容相同，也收敛到同一
+   运行。
+2. **提交标识身份 `(source_run_id, idempotency_key)`**（部分唯一索引，
+   仅约束非空键）：对同一来源运行，**一个提交标识只能绑定一套替换内容**。
+   同键但替换内容不一致——无论是顺序重放还是多实例并发——先到的一侧创建
+   派生运行，另一侧**明确失败**，返回
+   `409 derivation_idempotency_mismatch`，**绝不静默多产生一个运行**。
+
+归纳成表（同一来源运行下）：
+
+| 提交标识 | 替换内容 | 结果 |
+| --- | --- | --- |
+| 相同 | 相同 | 同一个派生运行（重放 `created=false`） |
+| 相同 | **不同** | 只保留先到者；另一侧 `409 derivation_idempotency_mismatch` |
+| 不同 | 相同 | 同一个派生运行（按替换内容收敛） |
+| 不同 | 不同 | 各自独立的派生运行 |
+| 不带键 | 相同 | 同一个派生运行（按替换内容收敛） |
+| 不带键 | 不同 | 各自独立的派生运行 |
+
+* 提交标识的作用域是“来源运行”：不同来源可复用同一键。
+* **冲突报错会点名定位**：消息包含发生冲突的**提交标识**、**来源运行
+  id**、胜出派生运行 id，并**逐项列出分歧输入**——env/config 给出点分叶子
+  路径（如 `config input 'lr': committed value 0.9 vs rejected value 0.2`），
+  制品给出具体制品 id（替换目标不一致 / 被移除项不一致），不会只抛一个
+  笼统的“冲突”。
+* **被拒一侧零残留**：冲突时整笔事务（新运行 + 制品输入引用
+  `run_artifacts` + 派生记录 `run_derivations` + 血缘边 `lineage_edges`）
+  回滚，不留下半成品；已成功的派生运行与只读的来源运行都不会被改动或
+  覆盖。
 * 每个派生都持久化一条 `run_derivations` 记录（来源、派生运行、替换摘要、
   逐项变更、时间），任何派生都能反查“从哪来、换了什么”：
   `GET /runs/{derived_run_id}/derivation`。普通运行查派生记录 →
   `404 derivation_not_found`。`GET /runs/{id}` 的 `derived_from` 字段给出
   直接来源（非派生运行为 `null`）。
+* **旧库升级**：由修复前版本写出、同一 `(source_run_id, idempotency_key)`
+  已存在多条记录的数据库，在服务重新打开时会自动迁移——保留最早一条派生
+  记录、删除多余的派生记录及其 `derived_from` 血缘边（重复派生产生的运行
+  本身不删除），随后建立唯一索引；迁移动作有
+  `event=derivation_commit_id_deduped` 警告日志。
 
 ### 替换、指纹与逐项变更
 
@@ -148,11 +183,25 @@ created ──► queued ──► running ──► succeeded  (终态)
     `truncation_reason=scan_cap`。**绝不把截断结果当完整结果返回**；
   * `cursor` 不透明，非法游标 → `400 invalid_cursor`。
 
-### 并发、回收与边界
+### 并发、多实例部署与边界
 
-* 所有派生与制品登记/回收共用同一把服务锁并在单事务内落库
-  （新运行 + 制品引用 + 派生记录 + 血缘边原子提交），因此：
-  * 同一来源被并发派生、且替换集合相同 → **只产生一个运行**；
+* 单实例内，所有派生与制品登记/回收共用一把服务锁；跨实例（多进程/多台
+  机器连同一份本地数据）时，由 SQLite 落库约束兜底：
+  * 每个派生在一个 `BEGIN IMMEDIATE` 写事务内做**权威复检**后再插入
+    （新运行 + 制品引用 + 派生记录 + 血缘边原子提交）。进程锁只挡住本
+    进程；复检+唯一索引保证**多个服务实例同时派生同一来源**也只有一个
+    结果：
+    * 同一来源 + 同一提交标识 + **替换内容不同** → **只产生一个派生
+      运行**，另一侧拿到可区分的
+      `409 derivation_idempotency_mismatch`（消息点名提交标识、来源与
+      分歧输入，见“派生身份与提交标识唯一性”）；
+    * 同一来源 + 同一提交标识（或无键）+ 替换内容相同 → 两侧落到
+      **同一个派生运行**，先到者 `created=true`、另一侧 `created=false`；
+    * 不同提交标识或不同替换内容 → 各自独立的派生运行。
+  * 上述保证来自数据库层的两个唯一约束
+    （`(source_run_id, replacement_digest)` 与部分唯一索引
+    `(source_run_id, idempotency_key) WHERE idempotency_key IS NOT NULL`），
+    因此**不依赖“恰好只有一个进程”这一部署假设**。
   * 派生**不会引用不存在或已被/正被回收的制品**：替换目标在写入前统一校验，
     不存在 → `404 artifact_not_found`，已回收 → `409 artifact_deleted`，
     消息点名具体是哪一项；失败时事务回滚，**不留下半个派生运行**，也不会
@@ -262,12 +311,19 @@ created ──► queued ──► running ──► succeeded  (终态)
 ## 并发一致性
 
 * 服务内一把可重入锁串行化所有读-改-写序列；SQLite `BEGIN IMMEDIATE`
-  事务保证多行原子性，WAL + `busy_timeout` 提供持久层兜底。
+  事务保证多行原子性，WAL + `busy_timeout` 提供持久层兜底。**跨进程/多
+  实例的唯一性由数据库唯一约束（而非进程锁）保证**，见“并发、多实例
+  部署与边界”。
 * 同一运行被多个请求并发转移：每一步**恰好一个成功**，其余得到
   `already_in_state / illegal_transition / terminal_state`，不会状态越位。
 * 并发同幂等键提交只产生一个运行；并发同内容登记只计一次字节；
   回收与挂载并发不会产生悬空引用或半删除（见
   `tests/test_concurrency.py`）。
+* 两个**独立服务进程**打开同一数据目录、并发派生同一来源：
+  同提交标识不同替换内容只产生一个派生运行、另一侧得到可区分冲突；
+  同提交标识（或无键）相同替换内容收敛到同一运行（见
+  `tests/test_derivation_multiprocess.py`，真实 OS 进程 + Barrier 强制
+  撞车，重复多轮以防偶发）。
 
 ## HTTP 接口一览
 
@@ -303,9 +359,23 @@ GET    /integrity                          悬空引用巡检
 ```bash
 uv run pytest                      # 全量（含并发、竞态、成环、重跑校验）
 uv run pytest -k concurrency       # 仅并发竞态（含并发派生 / 派生撞回收）
+uv run pytest -k multiprocess      # 多实例/多进程共享同一本地 DB 的派生身份
 uv run pytest -k derivation        # 派生、幂等、逐项变更、后代分页
 uv run pytest -k "illegal or cycle or mismatch"
 ```
+
+其中 `tests/test_derivation_multiprocess.py` 用真实的 OS 子进程各自创建
+一个 `RegistryService`、指向同一个 `registry.db`，通过 `Barrier` 让两侧
+在同一时刻发起派生，并重复多轮，稳定复现并锁死以下结论：
+
+* 同一来源 + 同一提交标识 + **不同替换内容**：恰好一个派生运行，另一侧
+  `derivation_idempotency_mismatch`（消息含提交标识、来源运行 id、胜出
+  运行 id 与具体分歧输入），且库里没有多余的运行 / `run_artifacts` /
+  `run_derivations` / `lineage_edges` 记录，来源运行状态与配置不变；
+* 同一来源 + 同一提交标识（以及不带提交标识）+ **相同替换内容**：两侧
+  落到同一派生运行（一建一重放）；
+* 不同提交标识 + 不同替换内容：各自独立；
+* 修复前写出的重复记录在旧库重开时自动迁移。
 
 测试以非法状态转移、幂等冲突、血缘成环、不可复现重跑、并发更新与回收竞态
 为主；失败一律断言具体 `code` 以保证原因可区分。单测日志以
@@ -318,6 +388,8 @@ event=lineage_cycle_rejected upstream=run_a downstream=run_b relation=depends_on
 event=reproduction_checked run_id=run_... reproducible=False divergence_count=1
 event=run_derived source_run_id=run_... derived_run_id=run_... basis=source+replacement_digest changes=2
 event=derivation_idempotent_replay source_run_id=run_... derived_run_id=run_... basis=source+replacement_digest
+event=derivation_commit_conflict source_run_id=run_... winner_derived_run_id=run_... idempotency_key=iter-7 winner_digest=767dfa1c5b90 rejected_digest=1a2b3c4d5e6f diverging_inputs=1
+event=derivation_commit_id_deduped source_run_id=run_... idempotency_key=iter-7 kept_derivation_id=3 dropped_derivation_ids=4
 event=descendants_listed root_run_id=run_... returned=100 truncated=True basis=page_limit
 ```
 
@@ -331,6 +403,26 @@ curl -s -XPOST localhost:8000/runs/run_xxx/derivations \
   -H 'content-type: application/json' \
   -d '{"config":{"lr":0.2},"idempotency_key":"iter-7"}'
 curl -s "localhost:8000/runs/run_xxx/descendants?limit=50"
+```
+
+手工验证**多实例并发**（两个服务进程共用同一份本地数据，同一提交标识、
+不同替换内容；预期一个 `201`、一个 `409 derivation_idempotency_mismatch`，
+且 `descendants` 始终只有一个）：
+
+```bash
+# 终端 A 与终端 B 用相同的 ELR_DATA_DIR 各起一个实例（等于两个服务实例）
+ELR_DATA_DIR=./mp-demo uv run uvicorn main:app --port 8001
+ELR_DATA_DIR=./mp-demo uv run uvicorn main:app --port 8002
+
+# 先建好实验并让来源运行进入 succeeded，拿到 run_xxx，然后两端几乎同时发：
+curl -s -XPOST localhost:8001/runs/run_xxx/derivations -H 'content-type: application/json' \
+  -d '{"config":{"lr":0.2},"idempotency_key":"iter-7"}' &
+curl -s -XPOST localhost:8002/runs/run_xxx/derivations -H 'content-type: application/json' \
+  -d '{"config":{"lr":0.9},"idempotency_key":"iter-7"}' &
+wait
+# 一端 201（created=true），另一端 409 且 error.code=derivation_idempotency_mismatch，
+# 消息包含 iter-7、run_xxx、胜出 run id 与分歧输入 'lr'；
+curl -s "localhost:8001/runs/run_xxx/descendants"   # items 恰好 1 条
 ```
 
 ## 存储布局
