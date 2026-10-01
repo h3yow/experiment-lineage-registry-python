@@ -451,28 +451,17 @@ class RegistryService:
             )
 
             # --- idempotency / content-based dedupe ------------------------
-            existing = self.storage.get_derivation_by_replacement(source.id, digest)
-            if existing is not None:
-                if (
-                    req.idempotency_key is not None
-                    and existing.idempotency_key is not None
-                    and existing.idempotency_key != req.idempotency_key
-                ):
-                    self._derivation_key_conflict(existing, req)
-                log.info(
-                    "derivation_idempotent_replay",
-                    extra={"kv": {"source_run_id": source.id,
-                                  "derived_run_id": existing.derived_run_id,
-                                  "basis": "source+replacement_digest"}},
-                )
-                return self._derivation_view(existing, created=False), False
-
-            if req.idempotency_key is not None:
-                by_key = self.storage.get_derivation_by_idempotency(
-                    source.id, req.idempotency_key
-                )
-                if by_key is not None and by_key.replacement_digest != digest:
-                    self._derivation_key_conflict(by_key, req)
+            # Derivation identity:
+            # * keyed request   -> (source run, idempotency key). Replaying
+            #   the same key with the same content lands on the same derived
+            #   run; reusing the key with *different* content is rejected.
+            # * keyless request -> (source run, replacement content digest):
+            #   equivalent requests converge on one derived run.
+            # Different commit identifiers are independent namespaces and
+            # never collide with each other, even for identical content.
+            replay = self._derivation_replay_or_conflict(source.id, req, digest)
+            if replay is not None:
+                return self._derivation_view(replay, created=False), False
 
             # --- create the derived run, record and lineage edge atomically
             derived_shas = [
@@ -536,18 +525,18 @@ class RegistryService:
                     ):
                         self.storage.add_lineage_edge(edge)
             except sqlite3.IntegrityError:
-                # Cross-process race (multiple workers): another writer
-                # already committed this (source, replacement_digest). The
-                # transaction is rolled back; converge on the existing run.
-                winner = self.storage.get_derivation_by_replacement(source.id, digest)
-                if winner is not None:
-                    log.info(
-                        "derivation_idempotent_replay",
-                        extra={"kv": {"source_run_id": source.id,
-                                      "derived_run_id": winner.derived_run_id,
-                                      "basis": "unique_constraint_recovery"}},
-                    )
-                    return self._derivation_view(winner, created=False), False
+                # Cross-instance/cross-process race: another writer committed
+                # a conflicting derivation first (the per-process lock cannot
+                # see it). The transaction was rolled back, so this side left
+                # no run, no input refs and no lineage edge behind. Re-run
+                # the identity lookup against the now-visible winner:
+                # converge when the request is a replay, otherwise report the
+                # exact commit identifier that collided.
+                replay = self._derivation_replay_or_conflict(
+                    source.id, req, digest, recovery=True
+                )
+                if replay is not None:
+                    return self._derivation_view(replay, created=False), False
                 raise
             log.info(
                 "run_derived",
@@ -563,6 +552,45 @@ class RegistryService:
                 },
             )
             return self._derivation_view(record, created=True), True
+
+    def _derivation_replay_or_conflict(
+        self,
+        source_run_id: str,
+        req: DerivationRequest,
+        digest: str,
+        *,
+        recovery: bool = False,
+    ) -> RunDerivation | None:
+        """Return the existing record this request must converge on.
+
+        Raises ``IdempotencyConflictError`` when the commit identifier is
+        already bound to a different replacement set. Returns ``None`` when
+        no existing record claims this request's identity.
+        """
+        if req.idempotency_key is not None:
+            record = self.storage.get_derivation_by_idempotency(
+                source_run_id, req.idempotency_key
+            )
+            basis = "source+idempotency_key"
+        else:
+            record = self.storage.get_keyless_derivation_by_replacement(
+                source_run_id, digest
+            )
+            basis = "source+replacement_digest"
+        if record is None:
+            return None
+        if record.replacement_digest != digest:
+            # Same commit identifier, different replacement set: exactly one
+            # derivation may own the key per source run.
+            self._derivation_key_conflict(record, req)
+        log.info(
+            "derivation_idempotent_replay",
+            extra={"kv": {"source_run_id": source_run_id,
+                          "derived_run_id": record.derived_run_id,
+                          "basis": "unique_constraint_recovery" if recovery
+                                   else basis}},
+        )
+        return record
 
     def _validate_replacement_shape(
         self,
@@ -608,6 +636,7 @@ class RegistryService:
             "derivation_idempotency_conflict",
             extra={"kv": {"source_run_id": existing.source_run_id,
                           "derived_run_id": existing.derived_run_id,
+                          "idempotency_key": req.idempotency_key or "",
                           "basis": "idempotency_key"}},
         )
         raise IdempotencyConflictError(

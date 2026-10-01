@@ -26,6 +26,19 @@ from .models import (
     RunDerivation,
 )
 
+_DERIVATIONS_TABLE = """
+CREATE TABLE IF NOT EXISTS run_derivations (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_run_id      TEXT NOT NULL REFERENCES runs(id),
+    derived_run_id     TEXT NOT NULL REFERENCES runs(id),
+    idempotency_key    TEXT,
+    replacement_digest TEXT NOT NULL,
+    replacements_json  TEXT NOT NULL DEFAULT '{}',
+    changes_json       TEXT NOT NULL DEFAULT '[]',
+    created_at         TEXT NOT NULL
+);
+"""
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS experiments (
     id            TEXT PRIMARY KEY,
@@ -101,24 +114,43 @@ CREATE TABLE IF NOT EXISTS reproduction_attempts (
     attempted_at         TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_repro_run ON reproduction_attempts(run_id);
+"""
 
-CREATE TABLE IF NOT EXISTS run_derivations (
-    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_run_id      TEXT NOT NULL REFERENCES runs(id),
-    derived_run_id     TEXT NOT NULL REFERENCES runs(id),
-    idempotency_key    TEXT,
-    replacement_digest TEXT NOT NULL,
-    replacements_json  TEXT NOT NULL DEFAULT '{}',
-    changes_json       TEXT NOT NULL DEFAULT '[]',
-    created_at         TEXT NOT NULL,
-    UNIQUE(source_run_id, replacement_digest)
-);
+_SCHEMA += _DERIVATIONS_TABLE + """
 CREATE INDEX IF NOT EXISTS idx_deriv_source ON run_derivations(source_run_id);
 CREATE INDEX IF NOT EXISTS idx_deriv_derived ON run_derivations(derived_run_id);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_deriv_derived
     ON run_derivations(derived_run_id);
-CREATE INDEX IF NOT EXISTS idx_deriv_idem ON run_derivations(idempotency_key);
+-- One idempotency key per source run, enforced at the database level so the
+-- guarantee holds across service instances / processes sharing this file.
+-- SQLite treats NULL keys as distinct, so keyless derivations are unaffected.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_deriv_source_idem
+    ON run_derivations(source_run_id, idempotency_key);
+-- Content-addressed dedupe applies to *keyless* derivations: at most one
+-- keyless record per (source, replacement content). Keyed derivations are
+-- identified by their commit identifier instead, so different keys may
+-- legitimately carry identical replacement content.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_deriv_source_digest_keyless
+    ON run_derivations(source_run_id, replacement_digest)
+    WHERE idempotency_key IS NULL;
 """
+
+# Rebuild run_derivations when it still carries the legacy table-level
+# UNIQUE(source_run_id, replacement_digest) constraint, which wrongly folded
+# keyed derivations with different commit identifiers into one identity.
+_DERIVATIONS_MIGRATION = (
+    "ALTER TABLE run_derivations RENAME TO run_derivations_legacy;\n"
+    + _DERIVATIONS_TABLE.replace("IF NOT EXISTS ", "")
+    + """
+INSERT INTO run_derivations
+    (id, source_run_id, derived_run_id, idempotency_key, replacement_digest,
+     replacements_json, changes_json, created_at)
+SELECT id, source_run_id, derived_run_id, idempotency_key, replacement_digest,
+       replacements_json, changes_json, created_at
+FROM run_derivations_legacy;
+DROP TABLE run_derivations_legacy;
+"""
+)
 
 
 class Storage:
@@ -142,7 +174,21 @@ class Storage:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute("PRAGMA busy_timeout=30000")
         self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._migrate_schema()
         self._conn.executescript(_SCHEMA)
+
+    def _migrate_schema(self) -> None:
+        """Rebuild run_derivations if it predates key-scoped uniqueness."""
+        row = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'run_derivations'"
+        ).fetchone()
+        if row is None:
+            return
+        normalized = " ".join(row["sql"].split())
+        if "UNIQUE(source_run_id, replacement_digest)" not in normalized:
+            return
+        self.conn.executescript(_DERIVATIONS_MIGRATION)
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -499,11 +545,14 @@ class Storage:
             created_at=derivation.created_at,
         )
 
-    def get_derivation_by_replacement(
+    def get_keyless_derivation_by_replacement(
         self, source_run_id: str, replacement_digest: str
     ) -> RunDerivation | None:
+        """Content dedupe identity for *keyless* derivations only."""
         row = self.conn.execute(
-            "SELECT * FROM run_derivations WHERE source_run_id = ? AND replacement_digest = ?",
+            """SELECT * FROM run_derivations
+               WHERE source_run_id = ? AND replacement_digest = ?
+                 AND idempotency_key IS NULL""",
             (source_run_id, replacement_digest),
         ).fetchone()
         return _row_to_run_derivation(row) if row else None

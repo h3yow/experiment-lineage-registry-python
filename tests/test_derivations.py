@@ -417,3 +417,35 @@ def test_descendant_diamond_dedupes_and_reports_min_depth(make_service):
     assert depths[vb.derived_run_id] == 1
     assert depths[vd.derived_run_id] == 2
     assert page.truncated is False
+
+
+def test_derivation_identity_semantics(service):
+    """Identity = (source, commit key) for keyed requests, (source, content)
+    for keyless ones; different keys never collide, identical keyless
+    content always converges."""
+    exp = _experiment(service)
+    source = _terminal_run(service, exp, config={"lr": 0.1})
+
+    keyed_a, c = service.derive_run(source.id, DerivationRequest(
+        config={"lr": 0.2}, idempotency_key="k1"))
+    assert c is True
+    # Same key + same content -> replay of the same derived run.
+    replay, c = service.derive_run(source.id, DerivationRequest(
+        config={"lr": 0.2}, idempotency_key="k1"))
+    assert c is False and replay.derived_run_id == keyed_a.derived_run_id
+    # Different key, identical content -> independent derivation.
+    keyed_b, c = service.derive_run(source.id, DerivationRequest(
+        config={"lr": 0.2}, idempotency_key="k2"))
+    assert c is True and keyed_b.derived_run_id != keyed_a.derived_run_id
+    # Keyless request with the same content -> its own derivation.
+    keyless, c = service.derive_run(source.id, DerivationRequest(
+        config={"lr": 0.2}))
+    assert c is True
+    assert keyless.derived_run_id not in {
+        keyed_a.derived_run_id, keyed_b.derived_run_id}
+    # Keyless equivalent request -> converges on the keyless run.
+    keyless2, c = service.derive_run(source.id, DerivationRequest(
+        config={"lr": 0.2}))
+    assert c is False and keyless2.derived_run_id == keyless.derived_run_id
+
+    assert len(service.list_descendants(source.id).items) == 3

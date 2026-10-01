@@ -101,18 +101,35 @@ created ──► queued ──► running ──► succeeded  (终态)
 
 ### 派生身份与幂等
 
-* 服务端对“来源运行 + 规范化后的替换集合”计算 `replacement_digest`，
-  `(source_run_id, replacement_digest)` 唯一：**同一来源 + 同一套替换内容
-  重复提交，永远落到同一个派生运行**（首次 `201 created=true`，重放
-  `200 created=false`），即使不带 `idempotency_key` 也一样。
-* 带了 `idempotency_key` 时：键相同但替换内容对不上 →
-  `409 derivation_idempotency_mismatch`，**绝不悄悄产生第二个运行**。
-* 幂等作用域是“来源运行”：不同来源可复用同一键。
+派生的"身份"取决于是否携带提交标识（`idempotency_key`）。两条规则都由
+**数据库级唯一约束**兜底，因此在多服务实例、多进程共享同一份本地数据
+（同一个 SQLite 文件）时同样成立，不依赖单个进程内的锁：
+
+* **带 `idempotency_key`**：身份是 `(source_run_id, idempotency_key)`。
+  * 同一来源 + 同一键 + 相同替换内容 → 永远落到同一个派生运行
+    （首次 `201 created=true`，重放 `200 created=false`），并发下也
+    只创建一个；
+  * 同一来源 + 同一键 + **不同**替换内容 → 恰好保留先提交的一个，另一
+    侧得到 `409 derivation_idempotency_mismatch`，错误消息与日志指明
+    冲突的提交标识、来源运行与已存在的派生运行，**绝不悄悄多算一个**；
+  * 不同键互不干扰：即使替换内容完全相同，也是各自独立的派生运行
+    （与 `POST /runs` 的幂等键语义一致）。
+* **不带键**：身份是 `(source_run_id, replacement_digest)`——规范化后的
+  替换集合摘要。等价请求（键序、无害空白、易失时间字段、remove 列表的
+  顺序与重复不同）收敛到同一个派生运行。
+* 冲突或被拒绝的一侧**不留半成品**：派生运行、输入引用、派生记录与血缘
+  边在同一事务内写入，失败即整体回滚；已成功的派生结果与来源运行不被
+  改动或覆盖。
+* 幂等作用域是"来源运行"：不同来源可复用同一键。
 * 每个派生都持久化一条 `run_derivations` 记录（来源、派生运行、替换摘要、
-  逐项变更、时间），任何派生都能反查“从哪来、换了什么”：
+  逐项变更、时间），任何派生都能反查"从哪来、换了什么"：
   `GET /runs/{derived_run_id}/derivation`。普通运行查派生记录 →
   `404 derivation_not_found`。`GET /runs/{id}` 的 `derived_from` 字段给出
   直接来源（非派生运行为 `null`）。
+* 旧数据目录在启动时自动迁移：`run_derivations` 上把不同提交标识错误
+  折叠为同一身份的旧表级唯一约束会被重建（既有记录原样保留），唯一性
+  改由 `(source_run_id, idempotency_key)` 唯一索引与"仅无键记录"的
+  `(source_run_id, replacement_digest)` 部分唯一索引共同保证。
 
 ### 替换、指纹与逐项变更
 
@@ -241,6 +258,10 @@ created ──► queued ──► running ──► succeeded  (终态)
   （见“配置”一节）。
 * 派生血缘使用新 relation 值 `derived_from`，不与用户自定义 relation 冲突；
   既有 `/lineage` 与上下游查询语义不变。
+* 派生唯一性语义按提交标识修正（见"派生身份与幂等"）：不同
+  `idempotency_key` 的派生请求现在是各自独立的命名空间，不再因替换内容
+  相同而被折叠或判冲突；同键不同内容仍在任何部署形态下被拒绝。旧数据
+  目录启动时自动迁移，无需手工干预。
 
 ## 指标与参数
 
@@ -268,6 +289,12 @@ created ──► queued ──► running ──► succeeded  (终态)
 * 并发同幂等键提交只产生一个运行；并发同内容登记只计一次字节；
   回收与挂载并发不会产生悬空引用或半删除（见
   `tests/test_concurrency.py`）。
+* 派生的提交标识唯一性由数据库唯一约束保证，跨实例/跨进程同样成立：
+  两个服务实例并发地对同一来源使用同一 `idempotency_key` 派生时，替换
+  内容不同则**恰好一个成功**，另一个得到可区分的
+  `409 derivation_idempotency_mismatch` 且不留下任何运行、输入引用或
+  谱系记录；内容相同则两边收敛到同一个派生运行（见
+  `tests/test_derivation_multi_instance.py`）。
 
 ## HTTP 接口一览
 
@@ -304,6 +331,7 @@ GET    /integrity                          悬空引用巡检
 uv run pytest                      # 全量（含并发、竞态、成环、重跑校验）
 uv run pytest -k concurrency       # 仅并发竞态（含并发派生 / 派生撞回收）
 uv run pytest -k derivation        # 派生、幂等、逐项变更、后代分页
+uv run pytest -k multi_instance    # 多实例/多进程下的派生唯一性与旧库迁移
 uv run pytest -k "illegal or cycle or mismatch"
 ```
 
